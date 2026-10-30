@@ -8,16 +8,16 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 # ------------------------------------------------------------------
 # 0. CONFIG: edit these
 # ------------------------------------------------------------------
-PATH = "leads.parquet"
-TARGET = "Stage"                  # outcome column
-POSITIVE_CLASS = "Qualified"      # coded as 1; everything else coded as 0
+PATH = "/Users/trumanwells/data_5600project2/data/processed/champion_checklist.csv"
+TARGET = "adj_em"                  # outcome column
+POSITIVE_CLASS = "tournament_finish"      # coded as 1; everything else coded as 0
 PREDICTORS = None                 # e.g. ["age", "score", "source"]; None = use all other columns
 DROP_COLS = []                    # ID-like columns to exclude, e.g. ["lead_id"]
 
 # ------------------------------------------------------------------
 # 1. LOAD + MINIMAL PREP (no cleaning, just what statsmodels needs)
 # ------------------------------------------------------------------
-df = pd.read_parquet(PATH)
+df = pd.read_csv(PATH)
 df = df[df[TARGET].isin([POSITIVE_CLASS] + [v for v in df[TARGET].unique() if v != POSITIVE_CLASS])]
 y = (df[TARGET] == POSITIVE_CLASS).astype(int)
 
