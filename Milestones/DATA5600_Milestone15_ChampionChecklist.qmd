@@ -1,19 +1,7 @@
 ---
 title: "NCAA Champion Checklist"
 subtitle: "DATA 5600 — Milestone 15: Initial Logistic Regression"
-author: "DATA 5600 — Project 02 Group"
-format:
-  html:
-    toc: true
-    number-sections: true
-    code-fold: false
-    df-print: paged
-execute:
-  echo: true
-  warning: false
-  message: false
-  error: false
-jupyter: python3
+format: pdf
 ---
 
 # Research question and objective
@@ -147,10 +135,6 @@ We estimate three deliberately small models. The first is our baseline; the othe
 
 The general logistic model is
 
-\[
-\log\left(\frac{P(\text{champion}=1)}{1-P(\text{champion}=1)}\right)
-=\beta_0+\beta_1X_1+\cdots+\beta_kX_k.
-\]
 
 Each coefficient represents a change in **log-odds**, holding the other predictors in that model fixed. Exponentiating a coefficient gives an **odds ratio**. An odds ratio is *not* a percentage-point change in championship probability.
 
@@ -158,10 +142,6 @@ Each coefficient represents a change in **log-odds**, holding the other predicto
 
 Our initial model is
 
-\[
-\log\left(\frac{p}{1-p}\right)
-=\beta_0+\beta_1\left(\frac{\mathrm{AdjEM}-20}{5}\right).
-\]
 
 We scale AdjEM so that a one-unit increase in the model represents **five additional efficiency-margin points**. The intercept describes a team with AdjEM = 20, not an average team in every other respect.
 

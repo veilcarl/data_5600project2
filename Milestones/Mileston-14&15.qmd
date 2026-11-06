@@ -21,7 +21,7 @@ So, we are using a historical dataset for the Macfax database. We exported the s
 import pandas as pd
 
 # Load our NCAA champion checklist dataset
-data = pd.read_csv("data/processed/champion_checklist.csv")
+data = pd.read_csv("champion_checklist.csv")
 
 # Check the size of our dataset
 print(f"Observations: {len(data):,}")
