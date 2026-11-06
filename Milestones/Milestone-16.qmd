@@ -12,10 +12,10 @@ jupyter: python3
 
 ## Our model approach as of right now
 
-For our project we are doing logistic regression to identify which stats are associated with winning the National Championship. We are fitting our model ideas using frequentist logistic regression. So, we estimated our coefficient using maximum liklehood rather than Bayesian Priors. Our whole model is trying to figure which stats in the data are best for winning, so we are no using a Bayesian model. Since we aren't, a prior predictive check isn't necessary right now
+For our project we are doing logistic regression to identify which stats are associated with winning the National Championship. We are fitting our model ideas using frequentist logistic regression. So, we estimated our coefficient using maximum liklehood rather than Bayesian Priors. Our whole model is trying to figure out which stats in the data are best for winning, so we are not using a Bayesian model. Since we aren't, a prior predictive check is not necessary right now.
 
 ## Hyperparameters and our model development
 
 As we keep going with building our model, we plan to add more predictors spread around the idea of them being associated with winning. We have an issue from our ealier milestones with multicolinearity. To address this, penalized logistic regression using something like Ridge or Lasso. These can penalize large coefficients and reduce our overfitting.
 
-An important hyperparameter for these is the strength for regularization. We will need to find how much strength to give balance to the model.
+An important hyperparameter for these is the strength for regularization. We will need to find how much strength to give balance to the model. 
