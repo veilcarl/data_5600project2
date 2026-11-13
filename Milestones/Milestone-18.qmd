@@ -1,0 +1,417 @@
+---
+title: "NCAA Crystal Ball"
+subtitle: "Penalized Regression"
+format: pdf
+jupyter: python3
+---
+
+# Penalized Regression
+
+In Milestone 17 we used cross-validation to tune the probability cutoff for a model that predicts whether a team wins the NCAA national championship using only AdjEM. In this milestone we add more predictors and fit three penalized regression models (ridge, LASSO, and elastic net). We then compare them against our existing model runs.
+
+Penalized regression shrinks the coefficient estimates toward zero. This helps when we have several predictors, especially correlated ones, because it reduces overfitting and helps the model generalize to new seasons.
+
+## Choose predictors
+
+
+```{python}
+# ADD IN OTHER PREDICTORS< this has the one from exercise 17
+predictors = ["adj_em_5"] 
+
+## Load data. This is the same data prep as Milestone 17. We keep all Division I teams, drop rows missing the key inputs, scale AdjEM, and keep the 2022 and later seasons separate for testing.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+
+paths = [
+    Path("data/processed/champion_checklist.csv"),
+    Path("../data/processed/champion_checklist.csv")
+]
+
+data_path = next((p for p in paths if p.exists()), None)
+
+if data_path is None:
+    raise FileNotFoundError("Could not locate champion_checklist.csv")
+
+data = pd.read_csv(data_path)
+
+print(f"Loaded data from: {data_path}")
+
+# Keep all Division I teams, not just tournament teams
+teams = data[
+    data["is_d1"].astype(str).str.strip().str.lower().isin(
+        ["true", "t", "1"]
+    )
+].copy()
+
+# Keep observations with the inputs we need
+teams = teams.dropna(subset=["season", "adj_em", "champion"])
+
+# Scale AdjEM the same way as Milestone 15
+teams["adj_em_5"] = (teams["adj_em"] - 20) / 5
+
+# Keep later seasons separate for testing
+train = teams[teams["season"] <= 2021].copy()
+test = teams[teams["season"] >= 2022].copy()
+
+# Make sure the predictors exist and are numeric
+missing = [p for p in predictors if p not in teams.columns]
+if missing:
+    raise ValueError(f"These predictors are not in the data: {missing}")
+
+non_numeric = [p for p in predictors if not pd.api.types.is_numeric_dtype(teams[p])]
+if non_numeric:
+    raise ValueError(f"These predictors are not numeric: {non_numeric}")
+
+print(f"Training observations: {len(train)}")
+print(f"Training champions: {train['champion'].sum()}")
+print(f"\nTest observations: {len(test)}")
+print(f"Test champions: {test['champion'].sum()}")
+```
+
+## Set up the training and test data
+
+Penalized models can't handle missing values, so we drop any team that is missing one of our predictors. We then split each dataset into the predictors (`X`) and the outcome (`y`).
+
+We also set up the same 5-fold cross-validation as Milestone 17. `GroupKFold` keeps all the teams from a season in the same fold, so the model is always validated on seasons it has not seen. Finally, we define the same list of cutoffs and a small helper function that picks the best cutoff by F1 score, the same rule we used in Milestone 17. F1 makes more sense than accuracy here because there is only one champion per season, so a model that flags nobody would still be about 99.7% accurate.
+
+```{python}
+#| warning: false
+import numpy as np
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+train_p = train.dropna(subset=predictors)
+test_p = test.dropna(subset=predictors)
+
+X_train, y_train = train_p[predictors], train_p["champion"]
+X_test, y_test = test_p[predictors], test_p["champion"]
+groups = train_p["season"]
+
+print(f"Training teams with complete predictors: {len(train_p)}")
+print(f"Test teams with complete predictors: {len(test_p)}")
+
+# 5-fold cross-validation grouped by season
+cv = GroupKFold(n_splits=5)
+
+# Same cutoffs as Milestone 17
+cutoffs = [0.001, 0.002, 0.005, 0.01, 0.02,
+           0.03, 0.05, 0.10, 0.15, 0.20]
+
+# Find the cutoff with the best F1 score
+def best_cutoff(y, probs):
+    rows = []
+    for c in cutoffs:
+        preds = (np.asarray(probs) >= c).astype(int)
+        rows.append({
+            "Cutoff": c,
+            "Precision": precision_score(y, preds, zero_division=0),
+            "Recall": recall_score(y, preds, zero_division=0),
+            "F1": f1_score(y, preds, zero_division=0),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values(
+        ["F1", "Recall", "Cutoff"], ascending=[False, False, True]
+    ).iloc[0]
+```
+
+## Existing model run: Milestone 17 (AdjEM only)
+
+We rerun the Milestone 17 cross-validation so we have its predicted probabilities to compare against. It is the same logistic regression using only `adj_em_5`, fit with a season-grouped 5-fold split. We use the same teams as the penalized models so the comparison is fair.
+
+```{python}
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+m17_cv_probs = pd.Series(np.nan, index=train_p.index)
+
+for fold, (train_idx, valid_idx) in enumerate(
+    cv.split(train_p, groups=train_p["season"]), start=1
+):
+    fold_train = train_p.iloc[train_idx]
+    fold_valid = train_p.iloc[valid_idx]
+
+    model = smf.glm(
+        "champion ~ adj_em_5",
+        data=fold_train,
+        family=sm.families.Binomial()
+    ).fit()
+
+    m17_cv_probs.loc[fold_valid.index] = model.predict(fold_valid)
+
+assert m17_cv_probs.notna().all()
+print("Milestone 17 cross-validation complete!")
+```
+
+## Tune ridge, LASSO, and elastic net
+
+Each penalized model needs a regularization strength, `C`. A smaller `C` means more shrinkage. We don't know the best `C` ahead of time, so we try a grid of values and let cross-validation pick the best one. This is the same approach as the lesson.
+
+A few details
+
+- Each model is a pipeline that first standardizes the predictors with `StandardScaler()` and then fits the logistic regression. Penalized models require standardized predictors so the penalty treats every predictor fairly.
+- **Ridge** (`l2`) shrinks coefficients toward zero but never exactly to zero.
+- **LASSO** (`l1`) can shrink coefficients exactly to zero, so it also drops predictors.
+- **Elastic net** mixes both penalties. It has a second setting, `l1_ratio`, which controls how much of the penalty is LASSO versus ridge, so we tune both settings.
+- We use `GroupKFold` by season for the tuning, so it matches Milestone 17.
+- Instead of accuracy, the grid search scores each setting with log loss (`neg_log_loss`). Accuracy is not useful when there is one champion per season, and log loss rewards good predicted probabilities, which is what we need for choosing a cutoff.
+
+After tuning, we get cross-validated probabilities from each model's best setting and find its best cutoff by F1, exactly as in Milestone 17.
+
+```{python}
+#| warning: false
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Grid of regularization strengths (same as the lesson)
+C_grid = np.logspace(-10, 10, 30)
+
+models = {
+    "Ridge": (
+        Pipeline([
+            ("feature_engineering", StandardScaler()),
+            ("classification", LogisticRegression(penalty="l2"))
+        ]),
+        {"classification__C": C_grid}
+    ),
+    "LASSO": (
+        Pipeline([
+            ("feature_engineering", StandardScaler()),
+            ("classification", LogisticRegression(
+                penalty="l1", solver="saga", max_iter=5000, random_state=42
+            ))
+        ]),
+        {"classification__C": C_grid}
+    ),
+    "Elastic net": (
+        Pipeline([
+            ("feature_engineering", StandardScaler()),
+            ("classification", LogisticRegression(
+                penalty="elasticnet", solver="saga", max_iter=5000, random_state=42
+            ))
+        ]),
+        {
+            "classification__C": C_grid,
+            "classification__l1_ratio": [0.1, 0.25, 0.5, 0.75, 0.9]
+        }
+    ),
+}
+
+tuned = {}
+rows = []
+
+for name, (pipe, grid) in models.items():
+
+    # Tune the hyperparameters with cross-validation by season
+    tune = GridSearchCV(
+        pipe, grid, scoring="neg_log_loss",
+        cv=cv, n_jobs=-1, refit=True
+    )
+    tune.fit(X_train, y_train, groups=groups)
+    tuned[name] = tune
+
+    # Cross-validated probabilities from the best setting
+    cv_probs = cross_val_predict(
+        tune.best_estimator_, X_train, y_train,
+        cv=cv, groups=groups, method="predict_proba"
+    )[:, 1]
+
+    # Best cutoff by F1
+    best = best_cutoff(y_train, cv_probs)
+
+    rows.append({
+        "Model": name,
+        "Cutoff": best["Cutoff"],
+        "Precision": best["Precision"],
+        "Recall": best["Recall"],
+        "F1": best["F1"],
+    })
+
+    print(f"{name}: best settings = {tune.best_params_}")
+```
+
+## Add the non-regularized models
+
+To see what the penalty actually adds, we also need two models with no penalty:
+
+1. The same predictors with **no regularization**. This is the fairest comparison because it uses the same teams and standardized predictors, and the only difference is the penalty.
+2. The **Milestone 17** model from above, which uses AdjEM only.
+
+We find the best cutoff for each of them the same way, then put everything in one table.
+
+```{python}
+#| warning: false
+# Non-regularized logistic regression, same predictors
+plain_pipe = Pipeline([
+    ("feature_engineering", StandardScaler()),
+    ("classification", LogisticRegression(penalty=None, max_iter=5000))
+])
+
+plain_probs = cross_val_predict(
+    plain_pipe, X_train, y_train,
+    cv=cv, groups=groups, method="predict_proba"
+)[:, 1]
+
+best = best_cutoff(y_train, plain_probs)
+rows.append({
+    "Model": "Non-regularized",
+    "Cutoff": best["Cutoff"], "Precision": best["Precision"],
+    "Recall": best["Recall"], "F1": best["F1"],
+})
+
+# Milestone 17 model (AdjEM only)
+best = best_cutoff(y_train, m17_cv_probs)
+rows.append({
+    "Model": "Milestone 17 (AdjEM only)",
+    "Cutoff": best["Cutoff"], "Precision": best["Precision"],
+    "Recall": best["Recall"], "F1": best["F1"],
+})
+
+comparison = pd.DataFrame(rows)
+
+print("Cross-validation comparison (best cutoff for each model):")
+print(comparison.round(4).to_string(index=False))
+```
+
+### Cross-validation interpretation
+
+*(Write your comparison here: which model had the highest F1? Did any penalized model beat the non-regularized model and the Milestone 17 model? Keep in mind that there are only about 16 champions in the training seasons, so small F1 differences are noisy.)*
+
+## Compare the coefficients
+
+Here we look at the coefficients each model estimated after being fit on the full training data. The predictors were standardized, so the coefficients are on the same scale and can be compared directly. Look for coefficients that LASSO or elastic net shrank to exactly zero, and for how much ridge shrank the coefficients compared with the non-regularized model.
+
+```{python}
+#| warning: false
+plain_pipe.fit(X_train, y_train)
+
+all_fits = {name: tune.best_estimator_ for name, tune in tuned.items()}
+all_fits["Non-regularized"] = plain_pipe
+
+coef_table = pd.DataFrame(
+    {
+        name: np.concatenate([
+            fit.named_steps["classification"].intercept_.ravel(),
+            fit.named_steps["classification"].coef_.ravel()
+        ])
+        for name, fit in all_fits.items()
+    },
+    index=["Intercept"] + predictors
+)
+
+print(coef_table.round(3).to_string())
+```
+
+## Evaluate on the test seasons
+
+Now we see how each model does on the 2022 and later seasons, which none of the models saw during tuning. For each model we use its own best cutoff from cross-validation. The tuned penalized models were already refit on all of the training data by `GridSearchCV`, so we can use them directly.
+
+```{python}
+#| warning: false
+test_probs = {}
+
+for name, tune in tuned.items():
+    test_probs[name] = tune.best_estimator_.predict_proba(X_test)[:, 1]
+
+test_probs["Non-regularized"] = plain_pipe.predict_proba(X_test)[:, 1]
+
+# Milestone 17 model refit on all training data
+m17_full = smf.glm(
+    "champion ~ adj_em_5",
+    data=train_p,
+    family=sm.families.Binomial()
+).fit()
+test_probs["Milestone 17 (AdjEM only)"] = m17_full.predict(test_p)
+
+y_test_arr = y_test.to_numpy()
+test_rows = []
+
+for name, probs in test_probs.items():
+    cutoff = comparison.loc[comparison["Model"] == name, "Cutoff"].iloc[0]
+    preds = (np.asarray(probs) >= cutoff).astype(int)
+
+    test_rows.append({
+        "Model": name,
+        "Cutoff": cutoff,
+        "Precision": precision_score(y_test_arr, preds, zero_division=0),
+        "Recall": recall_score(y_test_arr, preds, zero_division=0),
+        "F1": f1_score(y_test_arr, preds, zero_division=0),
+        "Teams Flagged": int(preds.sum()),
+        "Champions Caught": int(((preds == 1) & (y_test_arr == 1)).sum()),
+    })
+
+test_comparison = pd.DataFrame(test_rows)
+
+print(f"Champions in the test seasons: {int(y_test.sum())}\n")
+print(test_comparison.round(4).to_string(index=False))
+```
+
+### Test interpretation
+
+*(Write your comparison here: did the penalized models hold up on the test seasons? Did the model that was best in cross-validation also do best on the test data?)*
+
+## Bootstrap confidence intervals
+
+Penalized regression doesn't give us the usual confidence intervals, so we bootstrap them, like in the lesson. To bootstrap, we:
+
+1. Resample the training teams with replacement.
+2. Refit the model on the resampled data.
+3. Save the coefficients.
+4. Repeat 100 times, then take the 2.5th and 97.5th percentiles of each coefficient as the interval.
+
+We do this for the best penalized model (the one with the highest cross-validation F1) and for the non-regularized model so we can compare their intervals. `clone()` makes a fresh, unfitted copy of the pipeline with the same settings, so the bootstrap refits do not overwrite our tuned model.
+
+```{python}
+#| warning: false
+from sklearn.base import clone
+from sklearn.utils import resample
+
+def bootstrap_ci(pipe, X, y, n_samples=100):
+    model = clone(pipe)
+    boot_est = np.empty((n_samples, X.shape[1] + 1))
+
+    for b in range(n_samples):
+        # Resample the training data with replacement
+        X_b, y_b = resample(X, y, replace=True, random_state=42 + b)
+
+        # Refit the model on the resampled data
+        model.fit(X_b, y_b)
+        clf = model.named_steps["classification"]
+
+        # Save the intercept and slopes
+        boot_est[b, :] = np.concatenate([clf.intercept_.ravel(), clf.coef_.ravel()])
+
+    return np.percentile(boot_est, 2.5, axis=0), np.percentile(boot_est, 97.5, axis=0)
+
+# Pick the best penalized model by cross-validated F1
+penalized = comparison[comparison["Model"].isin(["Ridge", "LASSO", "Elastic net"])]
+best_name = penalized.sort_values(
+    ["F1", "Recall"], ascending=[False, False]
+).iloc[0]["Model"]
+
+print(f"Best penalized model: {best_name}")
+
+pen_lo, pen_hi = bootstrap_ci(tuned[best_name].best_estimator_, X_train, y_train)
+pln_lo, pln_hi = bootstrap_ci(plain_pipe, X_train, y_train)
+
+ci_table = pd.DataFrame({
+    "Term": ["Intercept"] + predictors,
+    f"{best_name} low": pen_lo,
+    f"{best_name} high": pen_hi,
+    "Non-reg low": pln_lo,
+    "Non-reg high": pln_hi,
+})
+
+print(ci_table.round(3).to_string(index=False))
+```
+
+### Interval interpretation
+
+*(Write your comparison here: are the penalized intervals narrower or shifted toward zero compared with the non-regularized intervals? Which intervals include zero? Correlated predictors usually give wide non-regularized intervals, so check whether the penalty stabilized them.)*
+
+## Summary
+
+*(Write your overall conclusion here: which model would you use for the Crystal Ball and why? Did adding predictors and regularizing improve on the AdjEM-only model from Milestone 17?)*
