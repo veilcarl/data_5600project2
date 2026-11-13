@@ -13,10 +13,55 @@ Penalized regression shrinks the coefficient estimates toward zero. This helps w
 
 ## Choose predictors
 
-
 ```{python}
 # ADD IN OTHER PREDICTORS< this has the one from exercise 17
-predictors = ["adj_em_5"] 
+predictors = [
+    "season",
+    "team",
+    "team_slug",
+    "team_id",
+    "is_d1",
+    "made_tournament",
+    "tournament_seed",
+    "tournament_region",
+    "tournament_finish",
+    "champion",
+    "games_played",
+    "wins",
+    "losses",
+    "win_pct",
+    "adj_o",
+    "adj_d",
+    "adj_em",
+    "adj_tempo",
+    "rank_adi_o",
+    "rank_adj_d",
+    "rank_adj_em",
+    "adj_efg_pct",
+    "adj_opp_efg_pct",
+    "adj_efg_margin",
+    "adj_tov_pct",
+    "adj_opp_tov_pct",
+    "adj_tov_edge",
+    "adj_orb_pct",
+    "adj_drb_pct",
+    "adj_reb_edge",
+    "adj_ftr",
+    "adj_opp_ftr",
+    "adj_ftr_margin",
+    "ffi_adj",
+    "wab",
+    "sor_rank",
+    "net_rank",
+    "sos_rank",
+    "ap_poll_week6",
+    "total_fg3m",
+    "total_fg3a",
+    "three_pt_pct",
+    "total_ftm",
+    "total_fta",
+    "ft_pct",
+]
 
 ## Load data. This is the same data prep as Milestone 17. We keep all Division I teams, drop rows missing the key inputs, scale AdjEM, and keep the 2022 and later seasons separate for testing.
 
@@ -148,9 +193,9 @@ print("Milestone 17 cross-validation complete!")
 
 Each penalized model needs a regularization strength, `C`. A smaller `C` means more shrinkage. We don't know the best `C` ahead of time, so we try a grid of values and let cross-validation pick the best one. This is the same approach as the lesson.
 
-A few details
+A few details about thes models
 
-- Each model is a pipeline that first standardizes the predictors with `StandardScaler()` and then fits the logistic regression. Penalized models require standardized predictors so the penalty treats every predictor fairly.
+- Each model is a pipeline that first standardize the predictors with `StandardScaler()` and then fits the logistic regression. Penalized models require standardized predictors so the penalty treats every predictor fairly.
 - **Ridge** (`l2`) shrinks coefficients toward zero but never exactly to zero.
 - **LASSO** (`l1`) can shrink coefficients exactly to zero, so it also drops predictors.
 - **Elastic net** mixes both penalties. It has a second setting, `l1_ratio`, which controls how much of the penalty is LASSO versus ridge, so we tune both settings.
@@ -278,7 +323,7 @@ print(comparison.round(4).to_string(index=False))
 
 ### Cross-validation interpretation
 
-*(Write your comparison here: which model had the highest F1? Did any penalized model beat the non-regularized model and the Milestone 17 model? Keep in mind that there are only about 16 champions in the training seasons, so small F1 differences are noisy.)*
+* Write  comparison her
 
 ## Compare the coefficients
 
@@ -351,11 +396,11 @@ print(test_comparison.round(4).to_string(index=False))
 
 ### Test interpretation
 
-*(Write your comparison here: did the penalized models hold up on the test seasons? Did the model that was best in cross-validation also do best on the test data?)*
+*(Write our comparison here: did the penalized models hold up on the test seasons? Did the model that was best in cross-validation also do best on the test data?)*
 
 ## Bootstrap confidence intervals
 
-Penalized regression doesn't give us the usual confidence intervals, so we bootstrap them, like in the lesson. To bootstrap, we:
+Penalized regression doesn't give us the usual confidence intervals, so we bootstrap them.
 
 1. Resample the training teams with replacement.
 2. Refit the model on the resampled data.
