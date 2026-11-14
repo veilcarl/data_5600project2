@@ -1,0 +1,44 @@
+
+---
+title: "NCAA Crystal Ball — Predictor Exploration"
+format: html
+jupyter: python3
+---
+
+# Predictor Exploration
+
+This document contains exploratory research for our NCAA
+championship prediction model. The purpose is to investigate
+potential predictors and evaluate model specifications before
+using the findings in our DATA 5600 milestones.
+
+## Load and prepare data
+
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+paths = [
+    Path("data/processed/champion_checklist_v2.csv"),
+    Path("../data/processed/champion_checklist_v2.csv")
+]
+
+data_path = next(p for p in paths if p.exists())
+data = pd.read_csv(data_path)
+
+# All historically championship-eligible D1 teams
+teams = data.loc[
+    ~data["is_reclassifying"].fillna(False)
+].copy()
+
+teams["champion_label"] = (
+    teams["champion"].eq(True)
+).astype(int)
+
+# Historical training period only
+train = teams[teams["season"] <= 2021].copy()
+
+print("Training observations:", len(train))
+print("Historical champions:", train["champion_label"].sum())
+```
