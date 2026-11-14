@@ -9,9 +9,12 @@ Output:
 
 NCAA game rule
   2005-2025: season.type 3 and an NCAA headline ("MEN'S BASKETBALL CHAMP...", "NCAA", "FINAL FOUR",
-             "NATIONAL CHAMPIONSHIP", "CHAMPIONSHIP AT <city>", "<CITY> REGIONAL" / "<X> REGION");
+             "NATIONAL CHAMPIONSHIP", "CHAMPIONSHIP AT <city>", "<CITY> REGIONAL" / "<X> REGION"), or ESPN
+             tournamentId 22 (games ingested from the ESPN summary endpoint have no headline);
              NIT / CBI / CIT / CollegeInsider / Vegas 16 / TBC / Crown headlines excluded.
   2026:      championshipId = 6393.
+Teams: every team in an NCAA game; each must be D1 and not reclassifying that season (TeamSeasonMembership),
+  and every seeded team must have an NCAA game, or the build stops.
 First Four / Opening Round (game_date is a UTC date, so it is not used):
   headline "OPENING ROUND" / "PLAY-IN" / "FIRST FOUR"; 2011-2015 headline "1ST ROUND" (the NCAA called the
   First Four the first round then); 2026 bracketRound = 1; otherwise a game whose US-Eastern start date is
@@ -36,25 +39,19 @@ FIRST_FOUR_HEADLINE = r"(?:OPENING ROUND|PLAY-IN|FIRST FOUR)"
 
 # Known gaps in the Game table, patched by hand. (season, team name, field, value, reason)
 #   rounds_won entries are added to the computed count; first_four entries set the flag.
+#   Empty: the games behind the earlier overrides (2021 Baylor-Hartford, the 2017 and 2018 First Four
+#   games) are now in the DB (macfax Tasks 6f.3 / 6f.3b).
 #   No Oregon entry: the 2021 VCU no-contest is stored as an Oregon 1-0 "win" (headline "Oregon advances due
 #   to uncontested game"), so Oregon's advance is already counted and VCU stays at 0.
-OVERRIDES = [
-    (2021, "Baylor", "rounds_won", +1, "beat Hartford in the Round of 64; game missing (Hartford has no Team row)"),
-    (2017, "Mount St. Mary's", "first_four", True, "First Four win over New Orleans; game missing"),
-    (2017, "New Orleans", "first_four", True, "First Four loss to Mount St. Mary's; game missing"),
-    (2017, "Kansas St.", "first_four", True, "First Four win over Wake Forest; game missing"),
-    (2017, "Wake Forest", "first_four", True, "First Four loss to Kansas St.; game missing"),
-    (2018, "Radford", "first_four", True, "First Four win over LIU; game missing"),
-    (2018, "LIU", "first_four", True, "First Four loss to Radford; game missing"),
-]
-
-# Boston College's 2005-2009 NCAA games are stored under team 28 (Boston University); fixed upstream
-# (Tasks 6c/6d) before the final build. Not worked around here, only reported.
-BC_BU_MERGED_TEAM = 28
+OVERRIDES = []
+NCAA_TOURNAMENT_ID = "22"
 
 
 def load():
-    games = pd.read_csv(RAW / "outcome_games.csv", dtype={"championship_id": "string", "bracket_round": "string"})
+    games = pd.read_csv(RAW / "outcome_games.csv", dtype={"championship_id": "string", "bracket_round": "string",
+                                                          "tournament_id": "string"})
+    for side in ("home_d1", "away_d1", "home_reclass", "away_reclass"):
+        games[side] = games[side].map({"t": True, "f": False, True: True, False: False})
     seeds = pd.read_csv(RAW / "outcome_seeds.csv")
     teams = pd.read_csv(RAW / "outcome_teams.csv")
     games["start_utc"] = pd.to_datetime(games["start_utc"], utc=True)
@@ -67,8 +64,8 @@ def classify(games: pd.DataFrame) -> pd.DataFrame:
     g = games.copy()
     espn = g["season"] <= 2025
     is_other = g["headline_u"].str.contains(OTHER_EVENTS, regex=True)
-    g["is_ncaa"] = (espn & ~is_other & g["headline_u"].str.contains(NCAA_HEADLINE, regex=True)) | (
-        ~espn & (g["championship_id"] == "6393"))
+    ncaa_head = g["headline_u"].str.contains(NCAA_HEADLINE, regex=True) | (g["tournament_id"] == NCAA_TOURNAMENT_ID)
+    g["is_ncaa"] = (espn & ~is_other & ncaa_head) | (~espn & (g["championship_id"] == "6393"))
     local_date = g["start_utc"].dt.tz_convert("America/New_York").dt.date
     g["ff_by_time"] = [d <= ss + timedelta(days=3) for d, ss in zip(local_date, g["selection_sunday_date"])]
     ff_head = g["headline_u"].str.contains(FIRST_FOUR_HEADLINE, regex=True)
@@ -93,8 +90,17 @@ def build():
         g[["season", "home_team_id", "first_four"]].rename(columns={"home_team_id": "team_id"}),
         g[["season", "away_team_id", "first_four"]].rename(columns={"away_team_id": "team_id"}),
     ])
+    universe = part[["season", "team_id"]].drop_duplicates()
+    not_d1 = g[~(g["home_d1"].eq(True) & g["away_d1"].eq(True))]
+    if len(not_d1):
+        raise SystemExit(f"NCAA games with a team not D1 that season:\n{not_d1[['season', 'game_id', 'home_team_id', 'away_team_id']]}")
+    reclass = g[g["home_reclass"].eq(True) | g["away_reclass"].eq(True)]
+    if len(reclass):
+        raise SystemExit(f"NCAA games with a team reclassifying that season:\n{reclass[['season', 'game_id', 'home_team_id', 'away_team_id']]}")
     seeded = seeds[seeds["tournament_seed"].notna()][["season", "team_id"]]
-    universe = pd.concat([part[["season", "team_id"]], seeded]).drop_duplicates()
+    no_game = seeded.merge(universe, how="left", indicator=True).query("_merge == 'left_only'")
+    if len(no_game):
+        raise SystemExit(f"seeded teams with no NCAA game:\n{no_game[['season', 'team_id']]}")
 
     ff_teams = set(map(tuple, part[part["first_four"]][["season", "team_id"]].values))
     wins = (g[~g["first_four"] & g["winner"].notna()]
