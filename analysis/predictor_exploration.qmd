@@ -1,33 +1,56 @@
 
 ---
-title: "NCAA Crystal Ball — Predictor Exploration"
+title: "Crystal Ball — Predictor Exploration"
+subtitle: "NCAA Basketball Championship Prediction"
 format: html
 jupyter: python3
+execute:
+  warning: false
 ---
 
 # Predictor Exploration
 
-This document contains exploratory research for our NCAA
-championship prediction model. The purpose is to investigate
-potential predictors and evaluate model specifications before
-using the findings in our DATA 5600 milestones.
+Our goal is to identify predictors that improve national
+championship forecasts beyond overall team strength.
 
-## Load and prepare data
+We use historical seasons through 2021 for exploration and
+reserve 2022–2026 for final model evaluation.
+
+The current dataset contains pre-Selection Sunday statistics.
+Results are provisional until we construct comparable December
+snapshots.
+
+## 1. Load and Prepare Data
 
 ```{python}
 from pathlib import Path
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    log_loss,
+    average_precision_score,
+    brier_score_loss
+)
+
+# Find the v2 dataset
 paths = [
     Path("data/processed/champion_checklist_v2.csv"),
     Path("../data/processed/champion_checklist_v2.csv")
 ]
 
-data_path = next(p for p in paths if p.exists())
+data_path = next((p for p in paths if p.exists()), None)
+
+if data_path is None:
+    raise FileNotFoundError("Could not find the v2 dataset.")
+
 data = pd.read_csv(data_path)
 
-# All historically championship-eligible D1 teams
+# Keep all eligible D1 teams
 teams = data.loc[
     ~data["is_reclassifying"].fillna(False)
 ].copy()
@@ -36,9 +59,829 @@ teams["champion_label"] = (
     teams["champion"].eq(True)
 ).astype(int)
 
-# Historical training period only
-train = teams[teams["season"] <= 2021].copy()
+# Only historical development seasons
+train = teams.loc[
+    teams["season"] <= 2021
+].copy().reset_index(drop=True)
 
-print("Training observations:", len(train))
-print("Historical champions:", train["champion_label"].sum())
+cv = GroupKFold(n_splits=5)
+
+print("Training teams:", len(train))
+print("Training champions:", train["champion_label"].sum())
+print("Training seasons:", train["season"].nunique())
 ```
+
+## Compare the predictor combos
+
+```{python}
+
+# Candidate predictors grouped by basketball relevance
+
+base = ["adj_em", "wab_z", "sos_rank"]
+
+candidate_models = {
+    "AdjEM only": ["adj_em"],
+
+    "Strength + resume": base,
+
+    "Offense + defense": ["adj_o", "adj_d"],
+
+    "Offense + defense + resume": [
+        "adj_o", "adj_d", "wab_z", "sos_rank"
+    ],
+
+    "Add eFG margin":
+        base + ["adj_efg_margin"],
+
+    "Add turnover edge":
+        base + ["adj_tov_edge"],
+
+    "Add rebounding edge":
+        base + ["adj_reb_edge"],
+
+    "Add FT rate margin":
+        base + ["adj_ftr_margin"],
+
+    "Add 3PT percentage":
+        base + ["three_pt_pct"],
+
+    "Add FT percentage":
+        base + ["ft_pct"],
+
+    "Add 3PT attempt rate":
+        base + ["three_par"],
+
+    "Add recent wins":
+        base + ["last10_wins"],
+
+    "Add recent scoring margin":
+        base + ["last10_avg_margin"],
+
+    "Add four factors": base + [
+        "adj_efg_margin",
+        "adj_tov_edge",
+        "adj_reb_edge",
+        "adj_ftr_margin"
+    ],
+
+    "Add shooting + form": base + [
+        "three_pt_pct", "ft_pct", "last10_wins"
+    ],
+
+    "Expanded model": base + [
+        "adj_efg_margin",
+        "adj_tov_edge",
+        "adj_reb_edge",
+        "adj_ftr_margin",
+        "three_pt_pct",
+        "ft_pct",
+        "three_par",
+        "last10_wins",
+        "last10_avg_margin",
+        "adj_tempo"
+    ]
+}
+
+results = []
+
+for name, predictors in candidate_models.items():
+
+    X = train[predictors]
+    y = train["champion_label"]
+
+    assert X.notna().all().all(), name
+
+    probabilities = np.zeros(len(train))
+
+    # Hold entire seasons out during validation
+    for fit_idx, valid_idx in cv.split(
+        X, y, groups=train["season"]
+    ):
+
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                penalty="l2",
+                C=1.0,
+                max_iter=5000
+            )
+        )
+
+        model.fit(
+            X.iloc[fit_idx],
+            y.iloc[fit_idx]
+        )
+
+        probabilities[valid_idx] = (
+            model.predict_proba(
+                X.iloc[valid_idx]
+            )[:, 1]
+        )
+
+    # Rank teams within each season
+    ranked = train[
+        ["season", "team", "champion_label"]
+    ].copy()
+
+    ranked["probability"] = probabilities
+
+    ranked["rank"] = ranked.groupby(
+        "season"
+    )["probability"].rank(
+        ascending=False,
+        method="min"
+    )
+
+    champions = ranked.loc[
+        ranked["champion_label"] == 1
+    ]
+
+    results.append({
+        "Model": name,
+        "Predictors": len(predictors),
+        "Log Loss": log_loss(y, probabilities),
+        "Avg Precision": average_precision_score(
+            y, probabilities
+        ),
+        "Brier Score": brier_score_loss(
+            y, probabilities
+        ),
+        "Top 5": int(
+            (champions["rank"] <= 5).sum()
+        ),
+        "Top 10": int(
+            (champions["rank"] <= 10).sum()
+        ),
+        "Mean Champion Rank":
+            champions["rank"].mean()
+    })
+
+performance = pd.DataFrame(results).sort_values(
+    "Log Loss"
+)
+
+print("PREDICTOR COMPARISON — V2")
+print(performance.round(5).to_string(index=False))
+```
+
+## Note: NIL-Era Model Validity
+
+Our original model uses seasons 2005–2021 for training and 2022–2026 for testing. Since NCAA NIL rules took effect in July 2021, this division also separates the pre-NIL and NIL eras.
+
+This creates a potential distribution shift: relationships learned from historical college basketball may not completely represent modern roster construction and team performance.
+
+We investigated this by comparing an identical model across pre-NIL and NIL-era evaluation periods. Performance declined slightly in the NIL era, but the model still ranked all five modern champions in its top ten.
+
+We also tested walk-forward validation, adding completed NIL-era seasons to the training data as they became available. Results were nearly identical to the model trained only through 2021.
+
+These findings do not establish that NIL has or has not changed championship prediction. For now, we will retain the full historical dataset, test modern-era performance separately, and investigate whether roster-related predictors provide additional value. We will revisit this analysis with the expanded roster data in version 3.
+
+## Roster Continuity and Experience
+
+```{python}
+
+# Roster exploration: use training seasons with v2 roster data
+roster_train = train.loc[
+    train["season"].isin([2016, 2017, 2018, 2019, 2021])
+].copy().reset_index(drop=True)
+
+base_features = ["adj_em", "wab_z", "sos_rank"]
+
+roster_candidates = {
+    "Strength + resume": base_features,
+    "Add returner minutes":
+        base_features + ["ret_same_min_pct"],
+    "Add returner points":
+        base_features + ["ret_same_pts_pct"],
+    "Add prior minutes retained":
+        base_features + ["ret_prior_min_pct"],
+    "Add transfer share":
+        base_features + ["transfer_min_pct"],
+    "Add experience":
+        base_features + ["exp_prior_seasons"],
+    "Add returner points + transfers":
+        base_features + [
+            "ret_same_pts_pct",
+            "transfer_min_pct"
+        ]
+}
+
+print("ROSTER DATA COVERAGE")
+print("Teams:", len(roster_train))
+print("Champions:", roster_train["champion_label"].sum())
+print("\nRoster data quality:")
+print(roster_train["roster_quality"].value_counts())
+
+# One season per validation fold
+roster_cv = GroupKFold(n_splits=5)
+roster_results = []
+
+for name, features in roster_candidates.items():
+
+    X = roster_train[features]
+    y = roster_train["champion_label"]
+
+    assert X.notna().all().all(), name
+
+    probabilities = np.zeros(len(roster_train))
+
+    for fit_idx, valid_idx in roster_cv.split(
+        X, y, groups=roster_train["season"]
+    ):
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                max_iter=5000
+            )
+        )
+
+        model.fit(
+            X.iloc[fit_idx],
+            y.iloc[fit_idx]
+        )
+
+        probabilities[valid_idx] = (
+            model.predict_proba(
+                X.iloc[valid_idx]
+            )[:, 1]
+        )
+
+    ranked = roster_train[
+        ["season", "team", "champion_label"]
+    ].copy()
+
+    ranked["probability"] = probabilities
+    ranked["rank"] = ranked.groupby(
+        "season"
+    )["probability"].rank(
+        ascending=False,
+        method="min"
+    )
+
+    champions = ranked.loc[
+        ranked["champion_label"] == 1
+    ]
+
+    roster_results.append({
+        "Model": name,
+        "Log Loss": log_loss(y, probabilities),
+        "Avg Precision": average_precision_score(
+            y, probabilities
+        ),
+        "Top 5": int(
+            (champions["rank"] <= 5).sum()
+        ),
+        "Top 10": int(
+            (champions["rank"] <= 10).sum()
+        ),
+        "Mean Champion Rank": champions["rank"].mean()
+    })
+
+roster_performance = pd.DataFrame(
+    roster_results
+).sort_values("Log Loss")
+
+print("\nROSTER PREDICTOR COMPARISON")
+print(
+    roster_performance.round(5).to_string(index=False)
+)
+```
+
+## Roster Predictor Stability
+
+```{python}
+
+# Evaluate roster predictors across alternative samples.
+# Only historical training seasons are used.
+
+def roster_oof(frame, features):
+    frame = frame.reset_index(drop=True)
+    X = frame[features]
+    y = frame["champion_label"]
+
+    cv = GroupKFold(
+        n_splits=frame["season"].nunique()
+    )
+
+    probabilities = np.zeros(len(frame))
+
+    for train_idx, valid_idx in cv.split(
+        X, y, groups=frame["season"]
+    ):
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                max_iter=5000
+            )
+        )
+
+        model.fit(
+            X.iloc[train_idx],
+            y.iloc[train_idx]
+        )
+
+        probabilities[valid_idx] = (
+            model.predict_proba(
+                X.iloc[valid_idx]
+            )[:, 1]
+        )
+
+    return probabilities
+
+
+samples = {
+    "All roster seasons": roster_train,
+    "High-quality rosters": roster_train[
+        roster_train["roster_quality"] == "ok"
+    ],
+    "Exclude 2016": roster_train[
+        roster_train["season"] != 2016
+    ]
+}
+
+models_to_check = {
+    "Strength + resume": base_features,
+    "Add returner points":
+        base_features + ["ret_same_pts_pct"],
+    "Add returner minutes":
+        base_features + ["ret_same_min_pct"]
+}
+
+stability_rows = []
+
+for sample_name, frame in samples.items():
+    frame = frame.reset_index(drop=True)
+
+    for model_name, features in models_to_check.items():
+        probs = roster_oof(frame, features)
+
+        ranked = frame[
+            ["season", "champion_label"]
+        ].copy()
+
+        ranked["probability"] = probs
+        ranked["rank"] = ranked.groupby(
+            "season"
+        )["probability"].rank(
+            ascending=False, method="min"
+        )
+
+        champions = ranked[
+            ranked["champion_label"] == 1
+        ]
+
+        stability_rows.append({
+            "Sample": sample_name,
+            "Model": model_name,
+            "Teams": len(frame),
+            "Champions": int(
+                frame["champion_label"].sum()
+            ),
+            "Log Loss": log_loss(
+                frame["champion_label"], probs
+            ),
+            "Top 5": int(
+                (champions["rank"] <= 5).sum()
+            )
+        })
+
+stability_results = pd.DataFrame(stability_rows)
+
+print(
+    stability_results.round(5).to_string(index=False)
+)
+```
+
+## Pre-NIL vs. NIL-Only vs. Full-History Training
+
+```{python}
+
+# Compare historical training strategies on 2026.
+# The 2026 season is NEVER included in training.
+
+from sklearn.metrics import log_loss, brier_score_loss
+
+features = ["adj_em", "wab_z", "sos_rank"]
+
+train_periods = {
+    "Pre-NIL (2005-2021)":
+        teams["season"] <= 2021,
+
+    "NIL-only (2022-2025)":
+        teams["season"].between(2022, 2025),
+
+    "Full history (2005-2025)":
+        teams["season"] <= 2025
+}
+
+test_2026 = teams.loc[
+    teams["season"] == 2026
+].copy().reset_index(drop=True)
+
+assert test_2026["champion_label"].sum() == 1
+
+results_2026 = []
+
+for name, mask in train_periods.items():
+
+    training = teams.loc[mask].copy()
+
+    model = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            C=1.0,
+            solver="lbfgs",
+            max_iter=5000
+        )
+    )
+
+    model.fit(
+        training[features],
+        training["champion_label"]
+    )
+
+    probabilities = model.predict_proba(
+        test_2026[features]
+    )[:, 1]
+
+    ranked = test_2026[
+        ["team", "champion_label"]
+    ].copy()
+
+    ranked["score"] = probabilities
+    ranked["rank"] = ranked["score"].rank(
+        ascending=False,
+        method="min"
+    )
+
+    champion = ranked.loc[
+        ranked["champion_label"] == 1
+    ].iloc[0]
+
+    results_2026.append({
+        "Training Period": name,
+        "Training Teams": len(training),
+        "Training Champions": int(
+            training["champion_label"].sum()
+        ),
+        "Champion Rank": int(champion["rank"]),
+        "Log Loss": log_loss(
+            test_2026["champion_label"],
+            probabilities
+        ),
+        "Brier Score": brier_score_loss(
+            test_2026["champion_label"],
+            probabilities
+        ),
+        "Top 5": ", ".join(
+            ranked.nlargest(5, "score")["team"]
+        )
+    })
+
+era_results = pd.DataFrame(results_2026)
+
+print("2026 CHAMPIONSHIP MODEL COMPARISON")
+print(era_results.round(5).to_string(index=False))
+```
+
+## NIL-Era Walk-Forward Validation
+
+```{python}
+
+# Compare training strategies across 2024-2026.
+# All predictions use only prior completed seasons.
+
+features = ["adj_em", "wab_z", "sos_rank"]
+
+walkforward_rows = []
+
+for test_year in [2024, 2025, 2026]:
+
+    test_year_data = teams.loc[
+        teams["season"] == test_year
+    ].copy().reset_index(drop=True)
+
+    strategies = {
+        "Pre-NIL": teams["season"] <= 2021,
+
+        "NIL-only": teams["season"].between(
+            2022, test_year - 1
+        ),
+
+        "Full history": teams["season"] < test_year
+    }
+
+    for name, mask in strategies.items():
+
+        training = teams.loc[mask].copy()
+
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                solver="lbfgs",
+                max_iter=5000
+            )
+        )
+
+        model.fit(
+            training[features],
+            training["champion_label"]
+        )
+
+        probs = model.predict_proba(
+            test_year_data[features]
+        )[:, 1]
+
+        ranked = test_year_data[
+            ["team", "champion_label"]
+        ].copy()
+
+        ranked["probability"] = probs
+        ranked["rank"] = ranked["probability"].rank(
+            ascending=False,
+            method="min"
+        )
+
+        champion = ranked.loc[
+            ranked["champion_label"] == 1
+        ].iloc[0]
+
+        walkforward_rows.append({
+            "Season": test_year,
+            "Training": name,
+            "Train Champions": int(
+                training["champion_label"].sum()
+            ),
+            "Champion Rank": int(champion["rank"]),
+            "Log Loss": log_loss(
+                test_year_data["champion_label"],
+                probs
+            ),
+            "Brier": brier_score_loss(
+                test_year_data["champion_label"],
+                probs
+            ),
+            "Top 5 Hit": int(champion["rank"] <= 5)
+        })
+
+walkforward = pd.DataFrame(walkforward_rows)
+
+print("WALK-FORWARD RESULTS")
+print(walkforward.round(5).to_string(index=False))
+
+# Compare average performance across all three seasons
+summary = walkforward.groupby("Training").agg(
+    Avg_Log_Loss=("Log Loss", "mean"),
+    Avg_Brier=("Brier", "mean"),
+    Avg_Champion_Rank=("Champion Rank", "mean"),
+    Top_5_Hits=("Top 5 Hit", "sum")
+).sort_values("Avg_Log_Loss")
+
+print("\nTHREE-SEASON SUMMARY")
+print(summary.round(5).to_string())
+```
+
+## Does weighting recent seasons improve predictions?
+
+```{python}
+
+# Compare equal-weight and recent-weighted training.
+# Each test season is excluded from its training data.
+
+features = ["adj_em", "wab_z", "sos_rank"]
+
+weighting_strategies = {
+    "Full history": None,
+    "10-year half-life": 10,
+    "5-year half-life": 5
+}
+
+weighted_results = []
+
+for test_year in [2024, 2025, 2026]:
+
+    historical = teams.loc[
+        teams["season"] < test_year
+    ].copy()
+
+    test_data = teams.loc[
+        teams["season"] == test_year
+    ].copy()
+
+    for name, half_life in weighting_strategies.items():
+
+        # Most recent completed season has weight 1
+        ages = (
+            test_year - 1 - historical["season"].to_numpy()
+        )
+
+        if half_life is None:
+            weights = np.ones(len(historical))
+        else:
+            weights = 0.5 ** (ages / half_life)
+
+        # Normalize mean weight so regularization strength
+        # remains comparable across strategies.
+        weights = weights / weights.mean()
+
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                penalty="l2",
+                C=1.0,
+                max_iter=5000
+            )
+        )
+
+        model.fit(
+            historical[features],
+            historical["champion_label"],
+            standardscaler__sample_weight=weights,
+            logisticregression__sample_weight=weights
+        )
+
+        probs = model.predict_proba(
+            test_data[features]
+        )[:, 1]
+
+        actual = test_data["champion_label"].to_numpy()
+
+        # Convert team-level odds into a within-season
+        # distribution that sums to 1.
+        clipped = np.clip(probs, 1e-12, 1 - 1e-12)
+        odds = clipped / (1 - clipped)
+        season_probs = odds / odds.sum()
+
+        champion_idx = np.flatnonzero(actual == 1)
+        assert len(champion_idx) == 1
+
+        champ_idx = champion_idx[0]
+        champion_probability = season_probs[champ_idx]
+
+        ranked = pd.Series(probs).rank(
+            ascending=False,
+            method="min"
+        )
+
+        weighted_results.append({
+            "Season": test_year,
+            "Model": name,
+            "Log Loss": log_loss(actual, probs),
+            "Brier": brier_score_loss(actual, probs),
+            "Champion Rank": int(ranked.iloc[champ_idx]),
+            "Top 5": int(ranked.iloc[champ_idx] <= 5),
+            "Champion Share": champion_probability,
+            "Winner Log Score": -np.log(
+                champion_probability
+            )
+        })
+
+weighted_comparison = pd.DataFrame(weighted_results)
+
+print("RECENCY-WEIGHTED MODEL COMPARISON")
+print(
+    weighted_comparison.round(5).to_string(index=False)
+)
+
+weighted_summary = weighted_comparison.groupby(
+    "Model"
+).agg(
+    Avg_Log_Loss=("Log Loss", "mean"),
+    Avg_Brier=("Brier", "mean"),
+    Avg_Winner_Log_Score=("Winner Log Score", "mean"),
+    Avg_Champion_Rank=("Champion Rank", "mean"),
+    Top_5_Hits=("Top 5", "sum")
+).sort_values("Avg_Winner_Log_Score")
+
+print("\nRECENCY-WEIGHTED SUMMARY")
+print(weighted_summary.round(5).to_string())
+```
+
+## Provisional Model Comparison
+
+```{python}
+
+# Compare our leading feature sets and weighting strategies.
+# Retrospective evaluation: these seasons have already been
+# examined during exploratory model development.
+
+feature_sets = {
+    "Core 3": ["adj_em", "wab_z", "sos_rank"],
+    "Core 3 + FT%": [
+        "adj_em", "wab_z", "sos_rank", "ft_pct"
+    ]
+}
+
+weighting_options = {
+    "Equal": None,
+    "5-year half-life": 5
+}
+
+provisional_results = []
+
+for test_year in range(2022, 2027):
+
+    historical = teams.loc[
+        teams["season"] < test_year
+    ].copy()
+
+    future = teams.loc[
+        teams["season"] == test_year
+    ].copy().reset_index(drop=True)
+
+    actual = future["champion_label"].to_numpy()
+
+    assert actual.sum() == 1
+
+    for feature_name, features in feature_sets.items():
+
+        for weight_name, half_life in weighting_options.items():
+
+            ages = (
+                test_year - 1 -
+                historical["season"].to_numpy()
+            )
+
+            if half_life is None:
+                weights = np.ones(len(historical))
+            else:
+                weights = 0.5 ** (ages / half_life)
+
+            weights = weights / weights.mean()
+
+            model = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    penalty="l2",
+                    C=1.0,
+                    max_iter=5000
+                )
+            )
+
+            model.fit(
+                historical[features],
+                historical["champion_label"],
+                standardscaler__sample_weight=weights,
+                logisticregression__sample_weight=weights
+            )
+
+            probs = model.predict_proba(
+                future[features]
+            )[:, 1]
+
+            ranks = pd.Series(probs).rank(
+                ascending=False,
+                method="min"
+            )
+
+            winner_index = np.flatnonzero(actual == 1)[0]
+            winner_rank = int(ranks.iloc[winner_index])
+
+            provisional_results.append({
+                "Season": test_year,
+                "Features": feature_name,
+                "Weighting": weight_name,
+                "Log Loss": log_loss(actual, probs),
+                "Brier": brier_score_loss(actual, probs),
+                "Champion Rank": winner_rank,
+                "Top 5 Hit": int(winner_rank <= 5)
+            })
+
+provisional = pd.DataFrame(provisional_results)
+
+summary = provisional.groupby(
+    ["Features", "Weighting"]
+).agg(
+    Avg_Log_Loss=("Log Loss", "mean"),
+    Avg_Brier=("Brier", "mean"),
+    Avg_Champion_Rank=("Champion Rank", "mean"),
+    Top_5_Hits=("Top 5 Hit", "sum")
+).sort_values("Avg_Log_Loss")
+
+print("FIVE-SEASON MODEL COMPARISON")
+print(summary.round(5).to_string())
+
+print("\nYEAR-BY-YEAR RESULTS")
+print(
+    provisional.round(5).to_string(index=False)
+)
+```
+
+## Analysis Conclusions (for now)
+
+Our exploratory analysis compared multiple predictor combinations, roster statistics, and historical training strategies to identify a provisional model for predicting NCAA national champions.
+
+Overall, adjusted efficiency margin, Wins Above Bubble, and strength-of-schedule rank provided the most consistent starting point. Adding additional basketball statistics occasionally improved individual seasons, but did not consistently improve overall predictive performance.
+
+We also tested whether NIL-era training or additional weighting of recent seasons improved predictions. While the five-year recency-weighted model achieved slightly lower average log loss, its improvement was small and did not increase our top-five champion identification rate.
+
+Roster continuity showed promising results, particularly the percentage of team points scored by returning players. However, version 2 only provides five historical training champions with roster data, limiting how confidently we can evaluate these relationships.
+
+For now, we selected a three-predictor ridge logistic regression model trained on the full historical dataset with equal weights as our provisional baseline.
+
+Future work: Reevaluate roster continuity, transfer participation, and player experience using the expanded historical coverage in version 3. We will also investigate early-season data availability, probability calibration, and whether modern-era weighting improves predictions when roster variables are included.
+
+These findings are exploratory because several model choices were evaluated against the same recent seasons. Additional independent validation will be necessary before claiming reliable future-season performance.
