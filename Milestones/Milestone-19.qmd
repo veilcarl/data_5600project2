@@ -1,0 +1,464 @@
+---
+title: "NCAA Crystal Ball"
+subtitle: "Ridge, LASSO, and Elastic Net"
+format: pdf
+jupyter: python3
+---
+
+# Ridge, LASSO, and Elastic Net
+
+In Milestone 18, we used ridge logistic regression and cross-validation to tune regularization strength for predicting NCAA basketball national champions. Although ridge improved overall accuracy, it failed to identify any actual champions.
+
+For Milestone 19, we compare ridge, LASSO, and elastic net logistic regression using the same predictors and classification cutoff. We then bootstrap confidence intervals for the best-performing model and compare them with a non-regularized logistic regression model.
+
+## Choose predictors
+
+```{python}
+
+
+# Predictors selected from our exploratory analysis
+predictors = [
+    "adj_em",
+    "wab_z",
+    "sos_rank"
+]
+
+
+```
+
+## Load data. This is the same data prep as Milestone 17. We keep all Division I teams, drop rows missing the key inputs, scale AdjEM, and keep the 2022 and later seasons separate for testing.
+
+```{python}
+
+from pathlib import Path
+import pandas as pd
+
+# Load the validated v2 dataset
+data_path = Path("data/processed/champion_checklist_v2.csv")
+
+if not data_path.exists():
+    data_path = Path("../data/processed/champion_checklist_v2.csv")
+
+data = pd.read_csv(data_path)
+
+# Keep D1 teams eligible to win the national championship
+teams = data.loc[
+    ~data["is_reclassifying"].fillna(False)
+].copy()
+
+# A non-tournament team is a historical non-champion
+teams["champion_label"] = (
+    teams["champion"].eq(True)
+).astype(int)
+
+
+# Scale AdjEM to match our previous baseline model
+teams["adj_em_5"] = (teams["adj_em"] - 20) / 5
+
+
+# Keep post-2021 seasons separate for testing
+train = teams[teams["season"] <= 2021].copy()
+test = teams[teams["season"] >= 2022].copy()
+
+print("Training teams:", len(train))
+print("Training champions:", train["champion_label"].sum())
+print("Testing teams:", len(test))
+print("Testing champions:", test["champion_label"].sum())
+
+```
+
+
+
+## Set up the training and test data
+
+Penalized models can't handle missing values, so we drop any team that is missing one of our predictors. We then split each dataset into the predictors (`X`) and the outcome (`y`).
+
+We also set up the same 5-fold cross-validation as Milestone 17. `GroupKFold` keeps all the teams from a season in the same fold, so the model is always validated on seasons it has not seen. Finally, we define the same list of cutoffs and a small helper function that picks the best cutoff by F1 score, the same rule we used in Milestone 17. F1 makes more sense than accuracy here because there is only one champion per season, so a model that flags nobody would still be about 99.7% accurate.
+
+```{python}
+#| warning: false
+import numpy as np
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+train_p = train.dropna(subset=predictors)
+test_p = test.dropna(subset=predictors)
+
+
+X_train = train_p[predictors]
+y_train = train_p["champion_label"]
+
+X_test = test_p[predictors]
+y_test = test_p["champion_label"]
+
+groups = train_p["season"]
+
+
+print(f"Training teams with complete predictors: {len(train_p)}")
+print(f"Test teams with complete predictors: {len(test_p)}")
+
+# 5-fold cross-validation grouped by season
+cv = GroupKFold(n_splits=5)
+
+# Same cutoffs as Milestone 17
+cutoffs = [0.001, 0.002, 0.005, 0.01, 0.02,
+           0.03, 0.05, 0.10, 0.15, 0.20]
+
+# Find the cutoff with the best F1 score
+def best_cutoff(y, probs):
+    rows = []
+    for c in cutoffs:
+        preds = (np.asarray(probs) >= c).astype(int)
+        rows.append({
+            "Cutoff": c,
+            "Precision": precision_score(y, preds, zero_division=0),
+            "Recall": recall_score(y, preds, zero_division=0),
+            "F1": f1_score(y, preds, zero_division=0),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values(
+        ["F1", "Recall", "Cutoff"], ascending=[False, False, True]
+    ).iloc[0]
+```
+
+## Existing model run: Milestone 17 (AdjEM only)
+
+We rerun the Milestone 17 cross-validation so we have its predicted probabilities to compare against. It is the same logistic regression using only `adj_em_5`, fit with a season-grouped 5-fold split. We use the same teams as the penalized models so the comparison is fair.
+
+```{python}
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+m17_cv_probs = pd.Series(np.nan, index=train_p.index)
+
+for fold, (train_idx, valid_idx) in enumerate(
+    cv.split(train_p, groups=train_p["season"]), start=1
+):
+    fold_train = train_p.iloc[train_idx]
+    fold_valid = train_p.iloc[valid_idx]
+
+    model = smf.glm(
+        "champion_label ~ adj_em_5",
+        data=fold_train,
+        family=sm.families.Binomial()
+    ).fit()
+
+    m17_cv_probs.loc[fold_valid.index] = model.predict(fold_valid)
+
+assert m17_cv_probs.notna().all()
+print("Milestone 17 cross-validation complete!")
+```
+
+```{python}
+
+# Use the cutoff selected from our updated Milestone 17 model
+m17_cutoff_results = best_cutoff(y_train, m17_cv_probs)
+m17_cutoff = float(m17_cutoff_results["Cutoff"])
+
+print(f"Milestone 17 cutoff: {m17_cutoff:.3f}")
+print(f"Cross-validation F1: {m17_cutoff_results['F1']:.4f}")
+
+```
+
+## Tune ridge, LASSO, and elastic net
+
+Each penalized model needs a regularization strength, `C`. A smaller `C` means more shrinkage. We don't know the best `C` ahead of time, so we try a grid of values and let cross-validation pick the best one. This is the same approach as the lesson.
+
+A few details about thes models
+
+- Each model is a pipeline that first standardize the predictors with `StandardScaler()` and then fits the logistic regression. Penalized models require standardized predictors so the penalty treats every predictor fairly.
+- **Ridge** (`l2`) shrinks coefficients toward zero but never exactly to zero.
+- **LASSO** (`l1`) can shrink coefficients exactly to zero, so it also drops predictors.
+- **Elastic net** mixes both penalties. It has a second setting, `l1_ratio`, which controls how much of the penalty is LASSO versus ridge, so we tune both settings.
+- We use `GroupKFold` by season for the tuning, so it matches Milestone 17.
+- Instead of accuracy, the grid search scores each setting with log loss (`neg_log_loss`). Accuracy is not useful when there is one champion per season, and log loss rewards good predicted probabilities, which is what we need for choosing a cutoff.
+
+After tuning, we get cross-validated probabilities from each model's best setting and find its best cutoff by F1, exactly as in Milestone 17.
+
+
+```{python}
+#| warning: false
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Regularization strengths to test
+C_grid = [0.001, 0.01, 0.1, 1, 10, 100]
+
+# Define the three penalized logistic regression models
+models = {
+    "Ridge": (
+        LogisticRegression(
+            penalty="l2",
+            solver="lbfgs",
+            max_iter=5000
+        ),
+        {"classification__C": C_grid}
+    ),
+
+    "LASSO": (
+        LogisticRegression(
+            penalty="l1",
+            solver="saga",
+            max_iter=5000,
+            random_state=42
+        ),
+        {"classification__C": C_grid}
+    ),
+
+    "Elastic Net": (
+        LogisticRegression(
+            penalty="elasticnet",
+            solver="saga",
+            max_iter=5000,
+            random_state=42
+        ),
+        {
+            "classification__C": C_grid,
+            "classification__l1_ratio": [
+                0.25, 0.50, 0.75
+            ]
+        }
+    )
+}
+
+# Tune all three models using five-fold CV
+tuned_models = {}
+results = []
+
+for name, (regression, grid) in models.items():
+
+    pipeline = Pipeline([
+        ("feature_engineering", StandardScaler()),
+        ("classification", regression)
+    ])
+
+    search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=grid,
+        scoring="neg_log_loss",
+        cv=cv,
+        refit=True
+    )
+
+    search.fit(X_train, y_train, groups=groups)
+
+    tuned_models[name] = search
+
+    results.append({
+        "Model": name,
+        "Best C": search.best_params_[
+            "classification__C"
+        ],
+        "L1 Ratio": search.best_params_.get(
+            "classification__l1_ratio", np.nan
+        ),
+        "CV Log Loss": -search.best_score_
+    })
+
+# Display the results
+tuning_results = pd.DataFrame(results)
+
+print("REGULARIZATION TUNING RESULTS")
+print(tuning_results.round(5).to_string(index=False))
+
+```
+
+
+
+## Evaluate on test seasons
+
+We evaluate our tuned ridge, LASSO, and elastic net models on the 2022–2026 test seasons. These seasons were excluded from model training and hyperparameter tuning.
+
+We use the same 15% classification cutoff from Milestone 17 for all three models. We compare classification accuracy along with precision, recall, F1 score, and log loss to better understand how each model performs when predicting national champions.
+
+```{python}
+#| warning: false
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    log_loss
+)
+
+# Compare all three models on the held-out test seasons
+test_results = []
+actual = y_test.to_numpy()
+
+for name, search in tuned_models.items():
+
+    # Predict championship probabilities
+    probabilities = search.best_estimator_.predict_proba(
+        X_test
+    )[:, 1]
+
+    # Apply the same 15% cutoff
+    predictions = (
+        probabilities >= m17_cutoff
+    ).astype(int)
+
+    test_results.append({
+        "Model": name,
+        "Accuracy": accuracy_score(
+            actual, predictions
+        ),
+        "Precision": precision_score(
+            actual, predictions, zero_division=0
+        ),
+        "Recall": recall_score(
+            actual, predictions, zero_division=0
+        ),
+        "F1": f1_score(
+            actual, predictions, zero_division=0
+        ),
+        "Log Loss": log_loss(
+            actual, probabilities
+        ),
+        "Teams Flagged": int(predictions.sum()),
+        "Champions Found": int(
+            ((predictions == 1) & (actual == 1)).sum()
+        )
+    })
+
+test_comparison = pd.DataFrame(test_results)
+
+print("MILESTONE 19 TEST RESULTS")
+print(
+    test_comparison.round(5).to_string(index=False)
+)
+```
+
+## Bootstrap Confidence Intervals
+
+LASSO had the best accuracy, so we are gonna choose it for our bootstrap analysis. Compare its coefficient estimates with a non-regularized logistic regression using the same predictors
+
+```{python}
+#| warning: false
+
+from sklearn.base import clone
+
+# Best-performing penalized model by test accuracy
+lasso_model = tuned_models["LASSO"].best_estimator_
+
+# Non-regularized model using identical predictors
+plain_model = Pipeline([
+    ("feature_engineering", StandardScaler()),
+    ("classification", LogisticRegression(
+        penalty=None,
+        solver="lbfgs",
+        max_iter=5000
+    ))
+])
+
+plain_model.fit(X_train, y_train)
+
+# Extract intercept and standardized coefficients
+def get_coefficients(model):
+    clf = model.named_steps["classification"]
+
+    return np.concatenate([
+        clf.intercept_.ravel(),
+        clf.coef_.ravel()
+    ])
+
+# Point estimates from the full training data
+lasso_est = get_coefficients(lasso_model)
+plain_est = get_coefficients(plain_model)
+
+# Bootstrap entire seasons to preserve their structure
+rng = np.random.default_rng(42)
+seasons = train_p["season"].unique()
+season_values = train_p["season"].to_numpy()
+
+n_bootstrap = 100
+
+lasso_boot = []
+plain_boot = []
+
+for b in range(n_bootstrap):
+
+    sampled_seasons = rng.choice(
+        seasons,
+        size=len(seasons),
+        replace=True
+    )
+
+    indices = np.concatenate([
+        np.flatnonzero(season_values == season)
+        for season in sampled_seasons
+    ])
+
+    X_b = X_train.iloc[indices]
+    y_b = y_train.iloc[indices]
+
+    # Refit LASSO with its previously selected C
+    fitted_lasso = clone(lasso_model)
+    fitted_lasso.fit(X_b, y_b)
+
+    # Refit non-regularized model
+    fitted_plain = clone(plain_model)
+    fitted_plain.fit(X_b, y_b)
+
+    lasso_boot.append(
+        get_coefficients(fitted_lasso)
+    )
+    plain_boot.append(
+        get_coefficients(fitted_plain)
+    )
+
+lasso_boot = np.array(lasso_boot)
+plain_boot = np.array(plain_boot)
+
+# Percentile-based 95% bootstrap intervals
+lasso_ci = np.percentile(
+    lasso_boot, [2.5, 97.5], axis=0
+)
+
+plain_ci = np.percentile(
+    plain_boot, [2.5, 97.5], axis=0
+)
+
+# Compare coefficient estimates and intervals
+ci_results = pd.DataFrame({
+    "Term": ["Intercept"] + predictors,
+    "LASSO Estimate": lasso_est,
+    "LASSO Lower": lasso_ci[0],
+    "LASSO Upper": lasso_ci[1],
+    "Non-Reg Estimate": plain_est,
+    "Non-Reg Lower": plain_ci[0],
+    "Non-Reg Upper": plain_ci[1]
+})
+
+print("BOOTSTRAP COEFFICIENT COMPARISON")
+print(ci_results.round(4).to_string(index=False))
+```
+
+## Results
+
+The three models are performed similarly on our test data. LASSO did the best at 99.49%, and ridge and elastic net got 99.44%.
+
+All three models correctly identified 3 of the 5 national champions from 2022–2026. However, LASSO flagged only 10 teams compared to 11 for ridge and elastic net, giving it slightly better precision and F1 scores.
+
+Ridge had the lowest test log loss at 0.00958, meaning it performed slightly better at estimating championship probabilities. Overall, the differences were small, but LASSO performed best based on the test accuracy metric.
+
+## Bootsrap
+
+We used 100 bootstrap samples, resampling entire seasons, to estimate 95% confidence intervals for our LASSO model and a non-regularized logistic regression using the same predictors.
+
+LASSO generally produced smaller coefficient estimates and narrower confidence intervals than the non-regularized model. The largest change was with strength-of-schedule rank, where the coefficient decreased in magnitude from -0.6296 to -0.1008.
+
+Adjusted efficiency margin remained the most consistent predictor, with a positive confidence interval that did not include zero in either model. The intervals for WAB and strength-of-schedule rank included zero, suggesting greater uncertainty about their independent contributions.
+
+These results show how LASSO can reduce the influence of less informative predictors and stabilize coefficient estimates. However, with only 16 historical champions, the bootstrap intervals are approximate and should be interpreted cautiously.
+
+## Open Question moving forward
+
+1. We are wondering if maybe there is a turning point in the thresholds of these stats and thats the beginning of the NIL era. Since the NIL era has begun we have seen a significant increase in the parity of college basketball teams. It may be worth looking into whether a model of only the NIL seasons would be more accurate in predicting this current season
+
+2. Going along with that, maybe its also worth noting is we should impement a recency weighted model, meaning the most recent season is weighting higher when training our predictors for the same reason above. 
+
+3. One other thing to note for specifically our champion identifying factor is UCONN. Two seasons where there is a big difference in the values of stats and metrics of the champion is when UCONN won it in 2011 and 2014. We could maybe explore implementing a UCONN outlier rule where we could apply the model to every team EXCEPT UCONN if that improves our model results.

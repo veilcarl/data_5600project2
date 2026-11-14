@@ -1,4 +1,5 @@
-"""Team-game features: one row per D1 team-season, 2005-2026 except 2020 (pre-cutoff, D1 vs D1, 0-0 excluded).
+"""Team-game features: one row per D1 team-season with games, 2005-2026 except 2020 (pre-cutoff, D1 vs D1 by
+TeamSeasonMembership, 0-0 excluded).
 
 Input (run scripts/features/team_games_extract.sql first, from the repo root):
   data/raw/team_games_rows.csv   one row per team per pre-cutoff game
@@ -18,8 +19,8 @@ Columns
   location_quality                'none' 2005-07, 'partial' 2026, else 'ok'
   last10_wins, last10_avg_margin  T's last 10 games on or before the cutoff, by game start time
   close5_games, close5_wins       final margin <= 5
-  ot_games, ot_wins               periods > 2 (raw status.period 2005-2025 with the 2018 regulation fix;
-                                  period_count 2026); games with an unknown period count are not counted
+  ot_games, ot_wins               periods > 2 (Game.period_count); games with an unknown period count are
+                                  not counted
   q1_games, q1_wins               Quad 1 proxy: opponent pre-tournament rank_adj_em <= 30 home, <= 50 neutral,
                                   <= 75 away; NULL where location_quality = 'none'
 

@@ -5,6 +5,10 @@
 --
 -- Candidate games: 2005-2025 ESPN raw season.type = 3 (all postseason: NCAA, NIT, CBI, ...);
 -- 2026 ncaa.com raw championshipId = 6393 (the NCAA tournament). 2020 has no tournament.
+-- tournament_id: ESPN competitions[0].tournamentId (22 = NCAA tournament). Games ingested from the ESPN
+-- summary endpoint (_from_summary) carry it but no notes headline.
+-- home_d1 / away_d1, home_reclass / away_reclass: TeamSeasonMembership.is_d1 / is_reclassifying for that
+-- season (NULL = no membership row).
 -- start_utc: ESPN raw event date (2005-2025) or ncaa.com startTimeEpoch (2026). game_date is a UTC
 -- date for evening games, so outcome.py uses start_utc for any date logic.
 
@@ -23,12 +27,19 @@ SELECT g.season_year AS season,
        g.raw_json::jsonb -> '_raw' -> 'competitions' -> 0 -> 'notes' -> 0 ->> 'headline' AS headline,
        NULLIF(g.raw_json::jsonb -> '_raw' ->> 'championshipId', '') AS championship_id,
        NULLIF(g.raw_json::jsonb -> '_raw' ->> 'bracketRound', '') AS bracket_round,
+       NULLIF(g.raw_json::jsonb -> '_raw' -> 'competitions' -> 0 ->> 'tournamentId', '') AS tournament_id,
        g.home_team_id,
        g.away_team_id,
+       mh.is_d1 AS home_d1,
+       ma.is_d1 AS away_d1,
+       mh.is_reclassifying AS home_reclass,
+       ma.is_reclassifying AS away_reclass,
        g.home_score,
        g.away_score
 FROM core_game g
 JOIN core_season s ON s.year = g.season_year
+LEFT JOIN core_teamseasonmembership mh ON mh.team_id = g.home_team_id AND mh.season_id = s.id
+LEFT JOIN core_teamseasonmembership ma ON ma.team_id = g.away_team_id AND ma.season_id = s.id
 WHERE g.status = 'final'
   AND g.season_year BETWEEN 2005 AND 2026
   AND g.season_year <> 2020
