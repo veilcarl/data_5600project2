@@ -444,3 +444,21 @@ The three models are performed similarly on our test data. LASSO did the best at
 All three models correctly identified 3 of the 5 national champions from 2022–2026. However, LASSO flagged only 10 teams compared to 11 for ridge and elastic net, giving it slightly better precision and F1 scores.
 
 Ridge had the lowest test log loss at 0.00958, meaning it performed slightly better at estimating championship probabilities. Overall, the differences were small, but LASSO performed best based on the test accuracy metric.
+
+## Bootsrap
+
+We used 100 bootstrap samples, resampling entire seasons, to estimate 95% confidence intervals for our LASSO model and a non-regularized logistic regression using the same predictors.
+
+LASSO generally produced smaller coefficient estimates and narrower confidence intervals than the non-regularized model. The largest change was with strength-of-schedule rank, where the coefficient decreased in magnitude from -0.6296 to -0.1008.
+
+Adjusted efficiency margin remained the most consistent predictor, with a positive confidence interval that did not include zero in either model. The intervals for WAB and strength-of-schedule rank included zero, suggesting greater uncertainty about their independent contributions.
+
+These results show how LASSO can reduce the influence of less informative predictors and stabilize coefficient estimates. However, with only 16 historical champions, the bootstrap intervals are approximate and should be interpreted cautiously.
+
+## Open Question moving forward
+
+1. We are wondering if maybe there is a turning point in the thresholds of these stats and thats the beginning of the NIL era. Since the NIL era has begun we have seen a significant increase in the parity of college basketball teams. It may be worth looking into whether a model of only the NIL seasons would be more accurate in predicting this current season
+
+2. Going along with that, maybe its also worth noting is we should impement a recency weighted model, meaning the most recent season is weighting higher when training our predictors for the same reason above. 
+
+3. One other thing to note for specifically our champion identifying factor is UCONN. Two seasons where there is a big difference in the values of stats and metrics of the champion is when UCONN won it in 2011 and 2014. We could maybe explore implementing a UCONN outlier rule where we could apply the model to every team EXCEPT UCONN if that improves our model results.
