@@ -1,0 +1,161 @@
+---
+title: "NCAA Crystal Ball"
+subtitle: "Milestone 21 — PCR vs Penalized and Logistic Regression"
+author: "DATA 5600 Project 2"
+format: pdf
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+# Milestone 21: Compare models
+
+Our objective is to rank teams by their chance of becoming NCAA national champion using only information available by Selection Sunday. Here, PCR means **logistic regression on principal components** because `champion` is a binary outcome; ordinary least-squares PCR would create predictions outside 0–1 and is not appropriate for championship probabilities.
+
+We use v3. To compare roster variables on a consistent sample, we train on eligible D1 teams from 2009–2021 (12 tournaments) and reserve 2022–2026 (five tournaments) as a modern-era holdout. All standardization, missing-value imputation, and PCA are fit inside the cross-validation pipeline. Neither tournament outcome columns nor identities are predictors.
+
+## Data and candidate models
+
+```{python}
+from pathlib import Path
+import warnings, json, time
+warnings.filterwarnings('ignore')
+import numpy as np, pandas as pd
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import log_loss, average_precision_score, roc_auc_score, brier_score_loss
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+warnings.filterwarnings('ignore',category=RuntimeWarning)
+# Run from the repository root or from the Milestones folder.
+paths = [
+    Path("data/processed/champion_checklist_v3.csv"),
+    Path("../data/processed/champion_checklist_v3.csv"),
+    Path("champion_checklist_v3.csv"),
+]
+DATA = next((p for p in paths if p.exists()), None)
+if DATA is None:
+    raise FileNotFoundError("Place champion_checklist_v3.csv in data/processed/")
+d=pd.read_csv(DATA,low_memory=False)
+d=d[(~d.is_reclassifying)&d.season.between(2009,2026)].copy().reset_index(drop=True)
+d['y']=d.champion.eq(True).astype(int)
+train=d[d.season<=2021].copy().reset_index(drop=True)
+test=d[d.season>=2022].copy().reset_index(drop=True)
+base=['adj_em','wab_z','sos_rank']
+roster=base+['ret_same_min_pct','transfer_min_pct','ret_prior_min_pct','exp_prior_seasons']
+curated=['adj_o','adj_d','adj_em','adj_tempo','adj_efg_pct','adj_opp_efg_pct','adj_tov_pct','adj_opp_tov_pct','adj_orb_pct','adj_drb_pct','adj_ftr','adj_opp_ftr','ffi_adj','wab_z','sos_rank','win_pct','three_pt_pct','ft_pct','three_par','opp_three_par','last10_wins','last10_avg_margin','road_win_pct','q1_wins','ret_same_min_pct','transfer_min_pct','ret_prior_min_pct','exp_prior_seasons']
+wide=['games_played','wins','losses','win_pct','adj_o','adj_d','adj_em','adj_tempo','rank_adj_o','rank_adj_d','rank_adj_em','adj_efg_pct','adj_opp_efg_pct','adj_efg_margin','adj_tov_pct','adj_opp_tov_pct','adj_tov_edge','adj_orb_pct','adj_drb_pct','adj_reb_edge','adj_ftr','adj_opp_ftr','adj_ftr_margin','ffi_adj','wab','wab_z','sos_rank','total_fg3m','total_fg3a','three_pt_pct','total_ftm','total_fta','ft_pct','d1_games','d1_wins','d1_losses','fga','fg3a','three_par','opp_fga','opp_fg3a','opp_three_par','road_games','road_wins','road_win_pct','neutral_games','neutral_wins','last10_wins','last10_avg_margin','close5_games','close5_wins','ot_games','ot_wins','q1_games','q1_wins','ret_same_min_pct','transfer_min_pct','newcomer_min_pct','ret_prior_min_pct','ret_same_pts_pct','exp_prior_seasons']
+assert set(wide) <= set(d.columns)
+
+specs = [
+ ('AdjEM logistic',['adj_em'],'logit', [0.3,3,30]),
+ ('3-feature logistic',base,'logit',[0.03,0.3,3]),
+ ('3-feature unpenalized',base,'unpenalized',[None]),
+ ('3-feature + roster',roster,'ridge',[0.03,0.3,3]),
+ ('28-feature ridge',curated,'ridge',[0.03,0.3,3]),
+ ('28-feature lasso',curated,'lasso',[0.03,0.3,3]),
+ ('28-feature elastic',curated,'elastic',[0.03,0.3,3]),
+ ('28-feature PCA + logit',curated,'pca',[2,3,5,8,12,16,20]),
+ ('61-feature ridge',wide,'ridge',[0.03,0.3,3]),
+ ('61-feature PCA + logit',wide,'pca',[2,3,5,8,12,16,20,30]),
+]
+
+def model(kind, hyper):
+ steps=[('impute', SimpleImputer(strategy='median')),('scale',StandardScaler())]
+ if kind=='pca':
+  steps.append(('pca',PCA(n_components=int(hyper),svd_solver='full')))
+  lr=LogisticRegression(C=3,max_iter=2000,solver='lbfgs')
+ elif kind=='unpenalized':lr=LogisticRegression(C=np.inf,max_iter=2000,solver='lbfgs')
+ elif kind=='lasso':lr=LogisticRegression(C=float(hyper),penalty='l1',max_iter=600,tol=1e-3,solver='liblinear')
+ elif kind=='elastic':lr=LogisticRegression(C=float(hyper),penalty='elasticnet',l1_ratio=0.5,max_iter=500,tol=5e-3,solver='saga',random_state=42)
+ else:lr=LogisticRegression(C=float(hyper),max_iter=2000,solver='lbfgs')
+ steps.append(('model',lr))
+ return Pipeline(steps)
+
+def season_logloss(frame, probs):
+ tmp=frame[['season','y']].copy()
+ tmp['prob']=np.clip(np.asarray(probs),1e-8,1)
+ scores=[]
+ for year,g in tmp.groupby('season'):
+  score=g['prob'].to_numpy(); score=score/score.sum()
+  score_champ=score[g['y'].to_numpy()==1]
+  assert len(score_champ)==1,(year,len(score_champ))
+  scores.append(-np.log(np.clip(score_champ[0],1e-10,1)))
+ return float(np.mean(scores))
+
+def summaries(frame, probs):
+ z=frame[['season','team','y']].copy().reset_index(drop=True)
+ z['probs']=np.asarray(probs)
+ z['rank']=z.groupby('season')['probs'].rank(ascending=False,method='min')
+ champs=z[z.y==1].copy()
+ return {'season_nll':round(season_logloss(frame,probs),4),'binary_logloss':round(log_loss(frame.y,np.clip(probs,1e-8,1-1e-8)),5),'average_precision':round(average_precision_score(frame.y,probs),4),'brier':round(brier_score_loss(frame.y,probs),5),'top1':int((champs['rank']<=1).sum()),'top5':int((champs['rank']<=5).sum()),'top10':int((champs['rank']<=10).sum()),'median_winner_rank':float(champs['rank'].median()),'mean_winner_rank':round(float(champs['rank'].mean()),1), 'champions':len(champs),'winner_ranks':{str(row.season):int(row['rank']) for _,row in champs.iterrows()}}
+
+def tune(frame, cols, kind, hp, n_splits):
+ cv=GroupKFold(n_splits=n_splits)
+ folds=list(cv.split(frame[cols],frame.y,groups=frame.season))
+ ret=[]
+ for param in hp:
+  preds=np.empty(len(frame))
+  for fi,vi in folds:
+   m=model(kind,param)
+   m.fit(frame.iloc[fi][cols],frame.iloc[fi].y)
+   preds[vi]=m.predict_proba(frame.iloc[vi][cols])[:,1]
+  ret.append((season_logloss(frame,preds),param))
+ return min(ret,key=lambda x:x[0])
+
+```
+
+## Nested, season-grouped cross-validation
+
+We choose regularization strength or number of principal components using four-fold **inner** cross-validation grouped by season. For an honest model-family comparison, we evaluate predictions on five **outer** held-out groups of seasons. We select the model family from cross-validation, and only then examine 2022–2026. This avoids choosing the winner on the test set.
+
+Our main measure is **season-level champion negative log probability**: within each season, we normalize model scores across eligible teams to sum to one, then penalize the probability assigned to the true champion. Lower is better. We also report how many champions ranked in the season's top five. This is more useful than plain classification accuracy, which can be high by predicting no champions.
+
+```{python}
+# Run nested model comparison.
+results = []
+for name, cols, kind, params in specs:
+    outer = list(GroupKFold(n_splits=5).split(train[cols], train.y, groups=train.season))
+    oof_probs = np.empty(len(train))
+    for fit_idx, valid_idx in outer:
+        inner_train = train.iloc[fit_idx].reset_index(drop=True)
+        _, best_param = tune(inner_train, cols, kind, params, n_splits=4)
+        fitted = model(kind, best_param).fit(inner_train[cols], inner_train.y)
+        oof_probs[valid_idx] = fitted.predict_proba(train.iloc[valid_idx][cols])[:, 1]
+
+    cv = summaries(train, oof_probs)
+    _, refit_param = tune(train, cols, kind, params, n_splits=5)
+    final = model(kind, refit_param).fit(train[cols], train.y)
+    test_probs = final.predict_proba(test[cols])[:, 1]
+    heldout = summaries(test, test_probs)
+    results.append({
+        "Model": name,
+        "Predictors": len(cols),
+        "CV champion log loss": cv["season_nll"],
+        "CV top 5": f'{cv["top5"]}/{cv["champions"]}',
+        "Holdout log loss": heldout["season_nll"],
+        "Holdout top 5": f'{heldout["top5"]}/{heldout["champions"]}',
+        "Tuned parameter": refit_param,
+    })
+
+comparison = pd.DataFrame(results).sort_values("CV champion log loss")
+print(comparison.to_string(index=False))
+print("\nBest model family by cross-validation:", comparison.iloc[0]["Model"])
+```
+
+## Interpretation
+
+In this dataset, a model with many predictors is not necessarily more predictive. Many measures describe overlapping versions of team strength, and we have only 12 training-season champions to estimate a larger model. PCA does successfully compress correlated information, while ridge, LASSO, and elastic net constrain coefficients. However, none of these methods prevents data leakage or guarantees predictive improvement.
+
+The three-predictor model using adjusted efficiency margin, standardized Wins Above Bubble, and strength-of-schedule rank performed best in our nested cross-validation. Adding roster metrics or fitting much broader models generally reduced historical CV performance. A wide PCA model performed competitively on the modern holdout, but we should not select it merely because of a tiny difference on five test seasons. For now, the simpler three-predictor logistic specification is the more defensible championship model; the larger models remain useful sensitivity checks.
+
+### Caveats
+
+- These are exploratory results based on v3; they do not replace earlier v2 submission results.
+- One champion per tournament creates extreme imbalance. Season-level winner ranking and log loss are more meaningful decision criteria than 99% classification accuracy.
+- Our expanded sample excludes 2005–2008 so that `exp_prior_seasons` is uncensored. We should separately check a 2007-onward specification that omits experience.
+- Rosters for some older teams have incomplete player-box coverage; evaluate whether conclusions change when using only high-quality seasons.
+- Comparing models on this same holdout repeatedly would gradually overfit our decisions to 2022–2026. Future changes should rely on new season-grouped validation before touching test performance.

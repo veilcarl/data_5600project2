@@ -1,0 +1,126 @@
+---
+title: "NCAA Crystal Ball"
+subtitle: "Milestone 20 — PCA with Dataset v3"
+author: "DATA 5600 Project 2"
+format: pdf
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+# Milestone 20: Principal Component Analysis
+
+Our updated dataset has 87 columns and new historical roster-continuity coverage. We wanted to see whether PCA could combine correlated basketball predictors into a smaller set of meaningful components. We use 2009–2021 as our exploratory training period because the v3 experience measure is uncensored starting in 2009. The 2022–2026 seasons are kept out of this analysis for later model testing.
+
+## Load and prepare v3
+
+```{python}
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+
+paths = [
+    Path("data/processed/champion_checklist_v3.csv"),
+    Path("../data/processed/champion_checklist_v3.csv"),
+    Path("champion_checklist_v3.csv"),
+]
+data_path = next((p for p in paths if p.exists()), None)
+if data_path is None:
+    raise FileNotFoundError("Place champion_checklist_v3.csv in data/processed/")
+data = pd.read_csv(data_path)
+
+# Don't accidentally use tournament outcomes, identities, or quality flags as predictors.
+predictors = [
+    "adj_o", "adj_d", "adj_em", "adj_tempo",
+    "adj_efg_pct", "adj_opp_efg_pct", "adj_tov_pct", "adj_opp_tov_pct",
+    "adj_orb_pct", "adj_drb_pct", "adj_ftr", "adj_opp_ftr",
+    "ffi_adj", "wab_z", "sos_rank", "win_pct",
+    "three_pt_pct", "ft_pct", "three_par", "opp_three_par",
+    "last10_wins", "last10_avg_margin", "road_win_pct", "q1_wins",
+    "ret_same_min_pct", "transfer_min_pct", "ret_prior_min_pct", "exp_prior_seasons"
+]
+
+train = data.loc[
+    (~data["is_reclassifying"]) & data["season"].between(2009, 2021)
+].copy().reset_index(drop=True)
+train["champion_label"] = train["champion"].eq(True).astype(int)
+
+print(f"Teams: {len(train):,}; champions: {train['champion_label'].sum()}")
+print(f"Predictors: {len(predictors)}")
+print("Training years:", sorted(train["season"].unique()))
+```
+
+## Fit PCA (without looking at the outcome)
+
+We scale all predictors because variables such as efficiency margin, winning percentage, and roster retention have different units. We impute missing values and fit PCA only on historical training seasons.
+
+```{python}
+pca_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler()),
+    ("pca", PCA()),
+])
+components = pca_pipeline.fit_transform(train[predictors])
+pca = pca_pipeline.named_steps["pca"]
+explained = pd.DataFrame({
+    "PC": np.arange(1, len(predictors) + 1),
+    "Variance": pca.explained_variance_ratio_,
+    "Cumulative": np.cumsum(pca.explained_variance_ratio_)
+})
+print(explained.head(15).round(3).to_string(index=False))
+```
+
+## Scree plot
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+axes[0].plot(explained["PC"], explained["Variance"], marker="o")
+axes[0].set(xlabel="Principal component", ylabel="Variance explained", title="Scree plot")
+axes[1].plot(explained["PC"], explained["Cumulative"], marker="o")
+axes[1].axhline(0.80, linestyle="--", label="80%")
+axes[1].set(xlabel="Components retained", ylabel="Cumulative variance", title="Cumulative variance")
+axes[1].legend()
+plt.tight_layout()
+plt.show()
+```
+
+## What do the components represent?
+
+The loading shows how strongly each original standardized predictor contributes to each component. Signs are arbitrary; we interpret groups of large-magnitude loadings rather than one coefficient in isolation.
+
+```{python}
+loadings = pd.DataFrame(
+    pca.components_.T,
+    index=predictors,
+    columns=[f"PC{i}" for i in range(1, len(predictors) + 1)]
+)
+for name in ["PC1", "PC2", "PC3", "PC4"]:
+    print(f"\n{name}: highest absolute loadings")
+    print(loadings[name].loc[loadings[name].abs().nlargest(8).index].round(3).to_string())
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 5))
+nonchamp = train["champion_label"].eq(0).to_numpy()
+champ = ~nonchamp
+ax.scatter(components[nonchamp, 0], components[nonchamp, 2], s=8, alpha=.15, label="Other teams")
+ax.scatter(components[champ, 0], components[champ, 2], s=35, alpha=.9, label="Champions")
+ax.set(xlabel="PC1 (overall strength)", ylabel="PC3 (roster continuity / schedule)", title="Training teams in PCA space")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Interpretation
+
+The first component looks like overall team strength: AdjEM, WAB, the Four Factor Index, win percentage, and offensive/defensive ratings all load strongly on it. The second component looks more like playing style, including shooting selection, rebounding, and turnovers. The third and fourth components include roster continuity, transfers, experience, and schedule/late-season performance.
+
+This is useful because we can see that roster construction adds a distinct kind of information rather than just another version of adjusted efficiency. The first five components explain about 67% of the training-predictor variance; the first ten explain about 84%.
+
+**Is PCA the right approach?** PCA helps with multicollinearity and reduces the number of inputs to a model. However, it does not know which components predict national championships. A component can explain a lot of variance without predicting the outcome. We should compare PCA-based logistic regression with our existing logistic and penalized models using season-grouped cross-validation in Milestone 21, rather than automatically choosing the first several components.
