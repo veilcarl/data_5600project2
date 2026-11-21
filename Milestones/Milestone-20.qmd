@@ -1,0 +1,188 @@
+---
+title: "NCAA Crystal Ball"
+subtitle: "Milestone 20 — PCA with Dataset v3"
+author: "DATA 5600 Project 2"
+format: pdf
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+# Milestone 20: Principal Component Analysis
+
+Our updated dataset has 87 columns and expanded historical roster-continuity coverage. We wanted to see whether PCA could combine correlated basketball predictors into a smaller set of meaningful components, while also checking whether a more explicit *championship profile* (offense, defense, resume, recent form, and roster construction) is a better way to organize the predictors. PCA does not automatically impose minimum thresholds or choose variables that predict championships. We use 2009–2021 as our exploratory training period because the v3 experience measure is uncensored starting in 2009. The 2022–2026 seasons are kept out of this analysis for later model testing.
+
+## Load and prepare v3
+
+```{python}
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+
+paths = [
+    Path("data/processed/champion_checklist_v3.csv"),
+    Path("../data/processed/champion_checklist_v3.csv"),
+    Path("champion_checklist_v3.csv"),
+]
+data_path = next((p for p in paths if p.exists()), None)
+if data_path is None:
+    raise FileNotFoundError("Place champion_checklist_v3.csv in data/processed/")
+data = pd.read_csv(data_path)
+
+# Don't accidentally use tournament outcomes, identities, or quality flags as predictors.
+predictors = [
+    "adj_o", "adj_d", "adj_em", "adj_tempo",
+    "adj_efg_pct", "adj_opp_efg_pct", "adj_tov_pct", "adj_opp_tov_pct",
+    "adj_orb_pct", "adj_drb_pct", "adj_ftr", "adj_opp_ftr",
+    "ffi_adj", "wab_z", "sos_rank", "win_pct",
+    "three_pt_pct", "ft_pct", "three_par", "opp_three_par",
+    "last10_wins", "last10_avg_margin", "road_win_pct", "q1_wins",
+    "ret_same_min_pct", "transfer_min_pct", "ret_prior_min_pct", "exp_prior_seasons"
+]
+
+train = data.loc[
+    (~data["is_reclassifying"]) & data["season"].between(2009, 2021)
+].copy().reset_index(drop=True)
+train["champion_label"] = train["champion"].eq(True).astype(int)
+
+print(f"Teams: {len(train):,}; champions: {train['champion_label'].sum()}")
+print(f"Predictors: {len(predictors)}")
+print("Training years:", sorted(train["season"].unique()))
+```
+
+## Fit PCA (without looking at the outcome)
+
+We scale all predictors because variables such as efficiency margin, winning percentage, and roster retention have different units. We impute missing values and fit PCA only on historical training seasons.
+
+```{python}
+pca_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler()),
+    ("pca", PCA()),
+])
+components = pca_pipeline.fit_transform(train[predictors])
+pca = pca_pipeline.named_steps["pca"]
+explained = pd.DataFrame({
+    "PC": np.arange(1, len(predictors) + 1),
+    "Variance": pca.explained_variance_ratio_,
+    "Cumulative": np.cumsum(pca.explained_variance_ratio_)
+})
+print(explained.head(15).round(3).to_string(index=False))
+```
+
+## Scree plot
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+axes[0].plot(explained["PC"], explained["Variance"], marker="o")
+axes[0].set(xlabel="Principal component", ylabel="Variance explained", title="Scree plot")
+axes[1].plot(explained["PC"], explained["Cumulative"], marker="o")
+axes[1].axhline(0.80, linestyle="--", label="80%")
+axes[1].set(xlabel="Components retained", ylabel="Cumulative variance", title="Cumulative variance")
+axes[1].legend()
+plt.tight_layout()
+plt.show()
+```
+
+## What do the components represent?
+
+The loading shows how strongly each original standardized predictor contributes to each component. Signs are arbitrary; we interpret groups of large-magnitude loadings rather than one coefficient in isolation.
+
+```{python}
+loadings = pd.DataFrame(
+    pca.components_.T,
+    index=predictors,
+    columns=[f"PC{i}" for i in range(1, len(predictors) + 1)]
+)
+for name in ["PC1", "PC2", "PC3", "PC4"]:
+    print(f"\n{name}: highest absolute loadings")
+    print(loadings[name].loc[loadings[name].abs().nlargest(8).index].round(3).to_string())
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 5))
+nonchamp = train["champion_label"].eq(0).to_numpy()
+champ = ~nonchamp
+ax.scatter(components[nonchamp, 0], components[nonchamp, 2], s=8, alpha=.15, label="Other teams")
+ax.scatter(components[champ, 0], components[champ, 2], s=35, alpha=.9, label="Champions")
+ax.set(xlabel="PC1 (overall strength)", ylabel="PC3 (roster continuity / schedule)", title="Training teams in PCA space")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Domain-specific PCA: does the "championship profile" idea make sense?
+
+A single PCA finds directions of maximum variance across **all** predictors. It does not promise a separate component for offense, defense, or experience. We therefore also run separate PCAs within basketball domains **chosen before inspecting the champion labels**. These are exploratory dimensions, not yet a prediction model or a checklist with fitted thresholds.
+
+```{python}
+# Each domain contains pre-tournament measurements only.
+# A large score does not automatically imply "better" for roster construction.
+domains = {
+    "Offense": ["adj_o", "adj_efg_pct", "adj_tov_pct", "adj_orb_pct", "adj_ftr"],
+    "Defense": ["adj_d", "adj_opp_efg_pct", "adj_opp_tov_pct", "adj_drb_pct", "adj_opp_ftr"],
+    "Resume": ["wab_z", "sos_rank", "q1_wins", "road_win_pct"],
+    "Recent form": ["last10_wins", "last10_avg_margin", "win_pct"],
+    "Roster": ["ret_same_min_pct", "ret_prior_min_pct", "transfer_min_pct", "exp_prior_seasons"],
+}
+
+rows = []
+for domain, cols in domains.items():
+    domain_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=len(cols))),
+    ])
+    domain_pipeline.fit(train[cols])
+    domain_pca = domain_pipeline.named_steps["pca"]
+    pc1 = pd.Series(domain_pca.components_[0], index=cols)
+    rows.append({
+        "Domain": domain,
+        "Variables": len(cols),
+        "Variance in domain PC1": domain_pca.explained_variance_ratio_[0],
+        "Largest PC1 loadings": ", ".join(pc1.abs().nlargest(3).index),
+    })
+
+print(pd.DataFrame(rows).round(3).to_string(index=False))
+```
+
+```{python}
+# Check whether the roster measurements are equally reliable across seasons.
+# A quality flag is not itself evidence that a team is better or worse.
+quality = pd.crosstab(train["season"], train["roster_quality"])
+print("Historical roster-quality counts by season:")
+print(quality.to_string())
+```
+
+**Interpretation of domain PCA:** If a domain's first component explains a large share of variation, its predictors may be describing a common dimension. If not, it would be misleading to call one PC the complete measure of that domain. The roster component especially needs care: experienced, transfer-heavy, and highly continuous teams can represent different roster strategies. We should not turn high continuity into an automatic championship requirement.
+
+**Connection to our checklist hypothesis:** A championship team may need multiple *different strengths* rather than one exceptional composite score. PCA helps explore correlated measurements; a separate soft checklist, with continuous domain scores and possible penalties for weak categories, is what actually tests that idea. We will compare it against PCA-based logistic regression and penalized logistic regression in Milestone 21.
+
+## What our PCA results actually show
+
+Using **4,109 eligible team-seasons, 12 champions, and 28 pre-tournament predictors** from 2009–2021, we found that:
+
+- **PC1 explained 36.2%** of predictor variation. Its largest loadings involve adjusted efficiency margin, Wins Above Bubble, Four Factor Index, win percentage, and offense/defense. We interpret PC1 as **overall team strength**, not as an independently tested championship prediction.
+- **PC2 explained 11.3%** and largely represents differences in playing style (three-point reliance, offensive rebounding, turnover measures, and shooting).
+- **PC3 explained 8.4%** and mixed returning minutes, retained prior minutes, transfers, experience, strength of schedule, and recent results. Calling it *only* roster continuity would overstate the interpretation.
+- **9 components explain about 81.3%** of predictor variation; the first 5 explain 67.0%. This shows substantial compression, but variance explained is **not** the same thing as predicting champions accurately.
+
+In the PC1-versus-PC3 scatterplot, champions appear mostly to the **right** (high overall strength), while they are spread across multiple PC3 values. In other words, champions tend to be strong overall, but there is not one obvious roster/schedule profile shared by every champion.
+
+The domain-specific PCA adds an interpretable exploratory comparison: offense PC1 explains **48.6%**, defense **43.4%**, resume **66.0%**, recent form **88.8%**, and roster **59.7%** of variation in their respective domain variables. We do not interpret these as percentages of championship success.
+
+**Data limitation:** Roster data are not equally complete across years. For example, 2012 has 179 partial rosters and 2013 has 218. We should treat roster-based conclusions cautiously and test sensitivity to data quality in future modeling.
+
+## Interpretation
+
+The first component looks like overall team strength: AdjEM, WAB, the Four Factor Index, win percentage, and offensive/defensive ratings all load strongly on it. The second component looks more like playing style, including shooting selection, rebounding, and turnovers. The third and fourth components include roster continuity, transfers, experience, and schedule/late-season performance.
+
+This suggests that roster construction contains information that is not just another copy of overall adjusted efficiency, although PC3 and PC4 also reflect other factors.
+
+**Is PCA the right approach?** **Useful for exploration, not automatically our best final model.** PCA reduces overlapping information, but does not optimize the dimensions for predicting a national champion, nor does it enforce minimum championship standards. Because our outcome is binary, in Milestone 21 we compare **logistic regression on principal components** (a PCR-style approach for classification) against regularized and ordinary logistic regression using season-grouped cross-validation. We also test a separate soft checklist to evaluate our championship-profile hypothesis.

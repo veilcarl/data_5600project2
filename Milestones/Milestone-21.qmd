@@ -11,9 +11,9 @@ execute:
 
 # Milestone 21: Compare models
 
-Our objective is to rank teams by their chance of becoming NCAA national champion using only information available by Selection Sunday. Here, PCR means **logistic regression on principal components** because `champion` is a binary outcome; ordinary least-squares PCR would create predictions outside 0–1 and is not appropriate for championship probabilities.
+Our objective is to rank teams by their chance of becoming NCAA national champion using only information available by Selection Sunday. Here, we use **logistic regression on principal components** as a PCR-style extension for a binary target: `champion` is yes/no, so a logistic model produces probabilities in the 0–1 range. Strictly speaking, *classical PCR* means PCA followed by linear regression; our version is *principal-component logistic regression* to match the project objective.
 
-We use v3. To compare roster variables on a consistent sample, we train on eligible D1 teams from 2009–2021 (12 tournaments) and reserve 2022–2026 (five tournaments) as a modern-era holdout. All standardization, missing-value imputation, and PCA are fit inside the cross-validation pipeline. Neither tournament outcome columns nor identities are predictors.
+We use v3. To compare roster variables on a consistent sample, we train on eligible D1 teams from 2009–2021 (12 tournaments) and reserve 2022–2026 (five tournaments) as a modern-era holdout. All standardization, missing-value imputation, and PCA are fit inside the cross-validation pipeline. Neither tournament outcome columns nor identities are predictors. We also test an exploratory **soft championship checklist** that rewards strength across distinct categories and allows penalties for weak categories. This is a separate model candidate, not something PCA can do on its own.
 
 ## Data and candidate models
 
@@ -50,6 +50,57 @@ curated=['adj_o','adj_d','adj_em','adj_tempo','adj_efg_pct','adj_opp_efg_pct','a
 wide=['games_played','wins','losses','win_pct','adj_o','adj_d','adj_em','adj_tempo','rank_adj_o','rank_adj_d','rank_adj_em','adj_efg_pct','adj_opp_efg_pct','adj_efg_margin','adj_tov_pct','adj_opp_tov_pct','adj_tov_edge','adj_orb_pct','adj_drb_pct','adj_reb_edge','adj_ftr','adj_opp_ftr','adj_ftr_margin','ffi_adj','wab','wab_z','sos_rank','total_fg3m','total_fg3a','three_pt_pct','total_ftm','total_fta','ft_pct','d1_games','d1_wins','d1_losses','fga','fg3a','three_par','opp_fga','opp_fg3a','opp_three_par','road_games','road_wins','road_win_pct','neutral_games','neutral_wins','last10_wins','last10_avg_margin','close5_games','close5_wins','ot_games','ot_wins','q1_games','q1_wins','ret_same_min_pct','transfer_min_pct','newcomer_min_pct','ret_prior_min_pct','ret_same_pts_pct','exp_prior_seasons']
 assert set(wide) <= set(d.columns)
 
+# --- Additional hypothesis: a soft championship checklist ---
+# Build transparent, predetermined domain scores from features known by Selection Sunday.
+# For each season, a percentile of 1.0 is the best result on that metric.
+# Season comparisons are unsupervised and use no champion labels. A team-season can
+# be scored at Selection Sunday because all teams' pre-tournament metrics are known.
+# Avoid absolute hard cutoffs: a title-winning freshman/transfer-heavy roster should
+# not be excluded merely for falling below a continuity threshold.
+domain_directions = {
+    "profile_offense": {
+        "adj_o": +1, "adj_efg_pct": +1,
+        "adj_tov_pct": -1, "adj_orb_pct": +1,
+    },
+    "profile_defense": {
+        "adj_d": -1, "adj_opp_efg_pct": -1,
+        "adj_opp_tov_pct": +1, "adj_drb_pct": +1,
+    },
+    "profile_resume": {
+        "wab_z": +1, "sos_rank": -1, "q1_wins": +1,
+    },
+    "profile_form": {
+        "last10_wins": +1, "last10_avg_margin": +1,
+        "road_win_pct": +1,
+    },
+    "profile_roster": {
+        "ret_same_min_pct": +1, "ret_prior_min_pct": +1,
+        "exp_prior_seasons": +1,
+    },
+}
+for domain, directions in domain_directions.items():
+    metrics = []
+    for col, sign in directions.items():
+        pct = d.groupby("season")[col].rank(
+            ascending=(sign > 0), pct=True
+        )
+        metrics.append(pct.fillna(0.5))  # neutral when an input is unavailable
+    d[domain] = pd.concat(metrics, axis=1).mean(axis=1)
+
+core_domains = ["profile_offense", "profile_defense", "profile_resume"]
+d["profile_min_core"] = d[core_domains].min(axis=1)
+d["profile_weak_core"] = (d[core_domains] < 0.80).sum(axis=1)
+# The 80th percentile is a predeclared illustration, not an optimized cutoff.
+# Roster is deliberately NOT a hard minimum: freshman and transfer-driven
+# champions may have low continuity but still be exceptional teams.
+profile = [
+    "adj_em", "profile_offense", "profile_defense", "profile_resume",
+    "profile_form", "profile_roster", "profile_min_core", "profile_weak_core"
+]
+# Update training frames to include the new feature columns.
+train = d[d.season <= 2021].copy().reset_index(drop=True)
+test = d[d.season >= 2022].copy().reset_index(drop=True)
+
 specs = [
  ('AdjEM logistic',['adj_em'],'logit', [0.3,3,30]),
  ('3-feature logistic',base,'logit',[0.03,0.3,3]),
@@ -61,6 +112,7 @@ specs = [
  ('28-feature PCA + logit',curated,'pca',[2,3,5,8,12,16,20]),
  ('61-feature ridge',wide,'ridge',[0.03,0.3,3]),
  ('61-feature PCA + logit',wide,'pca',[2,3,5,8,12,16,20,30]),
+ ('Soft checklist + roster',profile,'ridge',[0.03,0.3,3]),
 ]
 
 def model(kind, hyper):
@@ -150,7 +202,41 @@ print("\nBest model family by cross-validation:", comparison.iloc[0]["Model"])
 
 In this dataset, a model with many predictors is not necessarily more predictive. Many measures describe overlapping versions of team strength, and we have only 12 training-season champions to estimate a larger model. PCA does successfully compress correlated information, while ridge, LASSO, and elastic net constrain coefficients. However, none of these methods prevents data leakage or guarantees predictive improvement.
 
-The three-predictor model using adjusted efficiency margin, standardized Wins Above Bubble, and strength-of-schedule rank performed best in our nested cross-validation. Adding roster metrics or fitting much broader models generally reduced historical CV performance. A wide PCA model performed competitively on the modern holdout, but we should not select it merely because of a tiny difference on five test seasons. For now, the simpler three-predictor logistic specification is the more defensible championship model; the larger models remain useful sensitivity checks.
+In our first v3 comparison (before adding the soft-checklist candidate), the three-predictor logistic specification was the strongest historical cross-validated model, while wide PCA was competitive on the modern holdout. The printed table above is the **updated** comparison, including the new checklist hypothesis; interpret the winning model based on that output rather than assuming more predictors must improve performance.
+
+A soft checklist tests a different idea from PCA: whether being strong *across* offense, defense, and resume—and avoiding a glaring weakness—adds information beyond AdjEM. The roster score is a separate, flexible input instead of a pass/fail threshold. These domain scores are simple averages of within-season percentiles chosen before viewing labels; they are **not** mathematically equivalent to PCA components.
+
+**Decision rule:** Favor the model with stronger *outer cross-validated* champion log loss and comparable champion rankings; use holdout results only as a final sanity check. If the checklist does not beat the baseline, retain it as an interpretable exploratory analysis rather than calling it our best predictive model.
+
+## Our actual v3 results and best model so far
+
+We completed the model comparison and selected a model family using **outer season-grouped cross-validation on 2009–2021**, without using the 2022–2026 holdout to select the winner. The training sample included **4,109 team-seasons and 12 champions**; the modern holdout contained **1,769 team-seasons and 5 champions**.
+
+| Model | CV champion log loss (lower is better) | CV champions top 5 | Modern holdout log loss | Holdout champions top 5 |
+|---|---:|---:|---:|---:|
+| **3-feature logistic (AdjEM, WAB z-score, SOS rank)** | **2.5545** | **10/12** | 2.1821 | 4/5 |
+| 3-feature unpenalized logistic | 2.5762 | 10/12 | **2.1399** | 4/5 |
+| AdjEM-only logistic | 2.6487 | 9/12 | 2.2760 | 4/5 |
+| Soft checklist + roster | 2.7471 | 9/12 | 2.2317 | 4/5 |
+| 61-feature PCA + logistic | 2.7515 | 9/12 | 2.1709 | 4/5 |
+| 3-feature + roster | 2.7651 | 8/12 | 2.2731 | 4/5 |
+| 28-feature PCA + logistic | 2.7909 | 7/12 | 2.2416 | 4/5 |
+| 28-feature ridge | 3.0056 | 7/12 | 2.2773 | 4/5 |
+| 28-feature elastic net | 3.2140 | 7/12 | 2.4425 | 4/5 |
+| 61-feature ridge | 3.4437 | 6/12 | 2.4412 | 4/5 |
+| 28-feature LASSO | 3.7779 | 5/12 | 2.6227 | 3/5 |
+
+*The log loss shown here is the mean negative log of the champion's probability after model scores are normalized within each season to sum to one. It is not ordinary binary log loss. Lower scores indicate more probability assigned to the actual winning team.*
+
+**Best model so far:** The **3-feature regularized logistic model** achieved the lowest *historical cross-validated* champion log loss (2.5545) and ranked 10 of 12 champions in its top five. The unpenalized version is very close (2.5762), and actually had the lowest log loss in the five modern holdout tournaments. We therefore regard the **three-predictor logistic family** as our benchmark; these data do not conclusively distinguish penalized from unpenalized logistic regression.
+
+**What about PCA?** The 61-feature PCA model is competitive on the modern holdout (2.1709 log loss) but worse on cross-validation (2.7515). PCA is helpful for combining correlated variables; it did **not** consistently outperform the simpler model for champion prediction.
+
+**What about the championship checklist?** The soft checklist tests our idea that a champion should be strong across offense, defense, and resume, without imposing rigid roster-continuity requirements. It is **interpretable**, but it scored 2.7471 in cross-validation and found 9/12 champions in its top five, versus 2.5545 and 10/12 for the baseline. We retain it as a promising *research direction*, not the winning model.
+
+**Interpretation:** Three predictors are not the only things that matter in real basketball. AdjEM already summarizes much of a team's offensive and defensive performance; WAB captures performance against opponents; SOS adds schedule context. Several additional columns may be redundant or too noisy to help with only 12 training champions. Our result is that **additional variables have not yet shown a reliable improvement out of sample**, not that roster continuity or shooting are irrelevant.
+
+**Next steps beyond these milestones:** Test whether roster-quality restrictions change the results; investigate interactions or alternative championship profiles, such as experienced returners versus strong newcomer/transfer groups; and evaluate later seasons prospectively. Keep new model tuning separate from the already-inspected 2022–2026 holdout.
 
 ### Caveats
 
@@ -158,4 +244,5 @@ The three-predictor model using adjusted efficiency margin, standardized Wins Ab
 - One champion per tournament creates extreme imbalance. Season-level winner ranking and log loss are more meaningful decision criteria than 99% classification accuracy.
 - Our expanded sample excludes 2005–2008 so that `exp_prior_seasons` is uncensored. We should separately check a 2007-onward specification that omits experience.
 - Rosters for some older teams have incomplete player-box coverage; evaluate whether conclusions change when using only high-quality seasons.
-- Comparing models on this same holdout repeatedly would gradually overfit our decisions to 2022–2026. Future changes should rely on new season-grouped validation before touching test performance.
+- We have already inspected the 2022–2026 holdout while exploring candidate models. Any additional design changes informed by it weaken its status as an untouched test; future model selection should rely on historical season-grouped validation.
+- The checklist cutoff of 80% and equal-weight domain definitions are hypotheses, not proven championship requirements. Testing many versions would need an additional nested selection procedure to avoid overfitting.
