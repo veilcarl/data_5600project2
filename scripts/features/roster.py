@@ -3,6 +3,7 @@
 Inputs (run scripts/features/roster_extract.sql first, from the repo root):
   data/raw/roster_player_games.csv   player-game rows, D1-vs-D1 final games, 0-0 games excluded
   data/raw/roster_team_games.csv     one row per team-game, with periods (OT) for minutes closure
+  data/raw/roster_ncaa_filled.csv    players ESPN left out of 2022-23 / 2023-24 boxes, from ncaa.com (link column)
   data/reference/player_id_aliases.csv   core_player ids, old -> new (ESPN re-issued ids)
 
 Output:
@@ -16,7 +17,15 @@ Definitions (season Y, team T, "pre" = game_date <= Selection Sunday):
   ret_prior_min_pct   share of T's Y-1 player minutes (all Y-1 games) by players who appear for T in Y pre-cutoff
   ret_same_pts_pct    share of T's pre-cutoff player points scored by same-team returners
   exp_prior_seasons   minutes-weighted mean count of seasons before Y with D1 game rows (any team)
-  exp_censored        True when Y - first season with player data < 4
+  exp_censored        True when Y - first season with player data (2005) < 4
+  roster_lookback_censored  True when Y-2 has no player data (the sit-out / redshirt lookback is cut off), False
+                      otherwise; NULL with the continuity columns
+  ncaa_filled         ncaa.com rows count as T's players: linked to core_player where the extract found one,
+                      otherwise one player per (team, exact name) across seasons, with no D1 rows elsewhere
+  ncaa_filled_min_pct share of team_min_obs from ncaa.com rows; 0 in seasons with ncaa.com rows (2023, 2024),
+                      NULL in other seasons (not filled, so unknown)
+  player_data_games_pct  share of T's pre-cutoff games with at least one player row; games without player rows
+                      (e.g. ESPN names-only boxes, 2005-2013) count as missing
   min_closure_pct     share of T's pre-cutoff games (with a known period count) whose player minutes are
                       within +-5 of 200 + 25 per OT period; roster_quality ok >= 0.90, partial >= 0.50, else poor
 Seasons whose Y-1 has no player data get NULL continuity and experience columns. Unknown is NULL, never 0.
@@ -32,6 +41,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 PG_PATH = ROOT / "data/raw/roster_player_games.csv"
 TG_PATH = ROOT / "data/raw/roster_team_games.csv"
+NCAA_PATH = ROOT / "data/raw/roster_ncaa_filled.csv"
 ALIAS_PATH = ROOT / "data/reference/player_id_aliases.csv"
 OUT_PATH = ROOT / "data/interim/roster.csv"
 
@@ -48,10 +58,25 @@ def load():
     pg = pd.read_csv(PG_PATH, dtype={"team_id": "Int64"})
     tg = pd.read_csv(TG_PATH, dtype={"periods": "Int64"})
     aliases = pd.read_csv(ALIAS_PATH)
+    nf = pd.read_csv(NCAA_PATH, dtype={"player_id": "Int64", "team_id": "Int64"})
+    pg = pd.concat([pg.assign(ncaa=False), ncaa_rows(nf)], ignore_index=True)
     pg["pre_cutoff"] = _flag(pg["pre_cutoff"])
     tg["pre_cutoff"] = _flag(tg["pre_cutoff"])
     pg["game_date"] = pd.to_datetime(pg["game_date"])
     return pg, tg, aliases
+
+
+def ncaa_rows(nf: pd.DataFrame) -> pd.DataFrame:
+    """ncaa.com rows as player-game rows; unlinked players get a negative id per (team, exact name), so the same
+    ncaa-only player in consecutive seasons on one team is a same-team returner."""
+    nf = nf.copy()
+    keys = (nf.loc[nf["player_id"].isna(), ["team_id", "name"]].drop_duplicates()
+              .sort_values(["team_id", "name"]).reset_index(drop=True))
+    keys["synth"] = -(keys.index + 1)
+    nf = nf.merge(keys, on=["team_id", "name"], how="left")
+    nf["player_id"] = nf["player_id"].fillna(nf["synth"].astype("Int64"))
+    nf["player_id"] = nf["player_id"].astype("int64")
+    return nf.drop(columns=["synth", "name", "link"]).assign(ncaa=True)
 
 
 def remap_ids(pg: pd.DataFrame, aliases: pd.DataFrame, stats: dict) -> pd.DataFrame:
@@ -106,11 +131,15 @@ def closure(pg: pd.DataFrame, tg: pd.DataFrame, stats: dict) -> pd.DataFrame:
 def build():
     stats = {}
     pg, tg, aliases = load()
-    stats["player_game_rows_in"] = len(pg)
+    stats["player_game_rows_in"] = int((~pg["ncaa"]).sum())
+    stats["ncaa_rows_in"] = int(pg["ncaa"].sum())
+    stats["ncaa_unlinked_players"] = int((pg["ncaa"] & (pg["player_id"] < 0)).groupby(pg["player_id"]).any().sum())
     pg = remap_ids(pg, aliases, stats)
     pg = assign_null_teams(pg, stats)
+    stats["ncaa_rows_kept"] = int(pg["ncaa"].sum())
     first_season = int(pg["season"].min())
     data_seasons = set(pg["season"].unique())
+    ncaa_seasons = set(pg.loc[pg["ncaa"], "season"].unique())
 
     # Player history: seasons with D1 rows; most recent D1 team in each season (latest game, all games).
     seasons_by_player = pg.groupby("player_id")["season"].agg(lambda s: sorted(set(s)))
@@ -118,9 +147,11 @@ def build():
     last = pg.sort_values(["game_date", "game_id"]).drop_duplicates(["player_id", "season"], keep="last")
     last_team = dict(zip(zip(last["player_id"], last["season"]), last["team_id"]))
 
-    pre = pg[pg["pre_cutoff"]]
+    pre = pg[pg["pre_cutoff"]].copy()
+    pre["ncaa_minutes"] = pre["minutes"].where(pre["ncaa"], 0.0)
     ps = (pre.groupby(["season", "team_id", "player_id"], as_index=False)
-             .agg(minutes=("minutes", "sum"), points=("points", "sum")))
+             .agg(minutes=("minutes", "sum"), points=("points", "sum"),
+                  ncaa_minutes=("ncaa_minutes", "sum")))
 
     def category(p, y, t):
         prior = last_team.get((p, y - 1), last_team.get((p, y - 2)))
@@ -149,6 +180,7 @@ def build():
         "team_min_obs": g["minutes"].sum(),
         "team_pts_obs": g["points"].sum(),
         "w_prior": g["w_prior"].sum(),
+        "ncaa_min": g["ncaa_minutes"].sum(),
     })
     for cat in ("same", "transfer", "newcomer"):
         agg[f"{cat}_min"] = ps[ps["cat"] == cat].groupby(["season", "team_id"])["minutes"].sum()
@@ -157,6 +189,11 @@ def build():
 
     out = teams.merge(agg, on=["season", "team_id"], how="left")
     out = out.merge(closure(pg, tg, stats), on=["season", "team_id"], how="left")
+    pre_tg = tg[tg["pre_cutoff"]]
+    with_rows = set(zip(pre["game_id"], pre["team_id"]))
+    has_rows = pd.Series([(gm, t) in with_rows for gm, t in zip(pre_tg["game_id"], pre_tg["team_id"])], index=pre_tg.index)
+    pdg = has_rows.groupby([pre_tg["season"], pre_tg["team_id"]]).mean().rename("player_data_games_pct").reset_index()
+    out = out.merge(pdg, on=["season", "team_id"], how="left")
     out["team_min_obs"] = out["team_min_obs"].fillna(0.0)
 
     has_min = out["team_min_obs"] > 0
@@ -176,6 +213,10 @@ def build():
                 "ret_same_pts_pct", "exp_prior_seasons"):
         out.loc[no_prev, col] = np.nan
     out["exp_censored"] = (out["season"] - first_season) < 4
+    out["roster_lookback_censored"] = pd.array(
+        np.where(no_prev, None, ~out["season"].sub(2).isin(data_seasons)), dtype="boolean")
+    out["ncaa_filled_min_pct"] = np.where(
+        has_min & out["season"].isin(ncaa_seasons), out["ncaa_min"].fillna(0.0) / out["team_min_obs"].where(has_min), np.nan)
 
     out["roster_quality"] = np.select(
         [out["min_closure_pct"] >= QUALITY_OK, out["min_closure_pct"] >= QUALITY_PARTIAL],
@@ -183,7 +224,8 @@ def build():
 
     cols = ["season", "team_id", "team_min_obs", "min_closure_pct", "roster_quality",
             "ret_same_min_pct", "transfer_min_pct", "newcomer_min_pct", "ret_prior_min_pct",
-            "ret_same_pts_pct", "exp_prior_seasons", "exp_censored"]
+            "ret_same_pts_pct", "exp_prior_seasons", "exp_censored", "roster_lookback_censored",
+            "ncaa_filled_min_pct", "player_data_games_pct"]
     out = out[cols].sort_values(["season", "team_id"]).reset_index(drop=True)
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUT_PATH, index=False, float_format="%.6f")

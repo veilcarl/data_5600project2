@@ -1,25 +1,25 @@
-"""Crystal Ball dataset v2: one row per D1 team-season, 2005-2026 except 2020, pre-Selection-Sunday features.
+"""Crystal Ball dataset v3: one row per D1 team-season, 2005-2026 except 2020, pre-Selection-Sunday features.
 
 Inputs (from the repo root, after the extracts and feature scripts have run):
   data/interim/base.csv         scripts/export_base_v2.sql (ratings, metrics, seeds, conference, AP week 6)
   data/interim/outcome.csv      scripts/features/outcome.py (NCAA tournament results; tournament teams only)
   data/interim/team_games.csv   scripts/features/team_games.py (D1-vs-D1 game features)
-  data/interim/roster.csv       scripts/features/roster.py (roster continuity; 2015+)
+  data/interim/roster.csv       scripts/features/roster.py (roster continuity; player data 2005+)
   data/raw/team_games_rows.csv  scripts/features/team_games_extract.sql (only to flag games with no period count)
 Output:
-  data/processed/champion_checklist_v2.csv
-  data/processed/coverage_v2.md   per season: non-null % of every column for seeded teams; roster_quality,
+  data/processed/champion_checklist_v3.csv
+  data/processed/coverage_v3.md   per season: non-null % of every column for seeded teams; roster_quality,
                                   location_quality and data_issue counts (all teams)
 
 Joins: left joins on (season, team_id) starting from base. Renamed: team_games games/wins/losses -> d1_games/d1_wins/
 d1_losses (base wins/losses count every opponent). base.champion (from tournament_finish) is checked against
 outcome.champion and dropped. tournament_region and tournament_finish are read for the checks but not written.
-Missing sources stay NULL, never 0: outcome columns are NULL for teams not in the NCAA tournament, roster columns for
-seasons before 2015 (continuity columns also for 2015, which has no prior season of player data).
+Missing sources stay NULL, never 0: outcome columns are NULL for teams not in the NCAA tournament, continuity columns for
+2005, which has no prior season of player data; ncaa_filled_min_pct outside 2023-2024 (no ncaa.com fill).
+v3 vs v2: roster.csv now covers 2005-2026 and adds ncaa_filled_min_pct, player_data_games_pct and
+roster_lookback_censored (taken from roster.csv instead of derived here).
 Added:
   wab_z                     WAB standardized within season: (wab - season mean) / season std (population, ddof=0)
-  roster_lookback_censored  True for 2016 (the Y-2 lookback for sit-out/redshirt years hits 2014, which has no
-                            player data), False for 2017+, NULL where continuity is NULL
   data_issue                ';'-separated known, unfixed data problems for that team-season (NULL = none known)
 The build stops (SystemExit) unless every check in check() holds.
 
@@ -34,8 +34,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 INTERIM = ROOT / "data/interim"
 TG_ROWS = ROOT / "data/raw/team_games_rows.csv"
-OUT_PATH = ROOT / "data/processed/champion_checklist_v2.csv"
-COVERAGE_PATH = ROOT / "data/processed/coverage_v2.md"
+OUT_PATH = ROOT / "data/processed/champion_checklist_v3.csv"
+COVERAGE_PATH = ROOT / "data/processed/coverage_v3.md"
 # Read for the checks, not written: tournament_region is filled only for 2026; tournament_finish is an outcome
 # (Champion / Runner-Up / Final Four only) that outcome.csv's columns cover.
 NOT_OUTPUT = ["tournament_region", "tournament_finish"]
@@ -57,6 +57,7 @@ KNOWN_ISSUES = [
 ]
 ROSTER_SHARES = ["ret_same_min_pct", "transfer_min_pct", "newcomer_min_pct"]
 ROSTER_CONTINUITY = ROSTER_SHARES + ["ret_prior_min_pct", "ret_same_pts_pct", "exp_prior_seasons"]
+FIRST_CONTINUITY_SEASON = 2006  # player data starts 2005, so the first season with a prior season is 2006
 
 
 def _bool(s: pd.Series) -> pd.Series:
@@ -70,6 +71,8 @@ def load():
     outcome = pd.read_csv(INTERIM / "outcome.csv")
     tg = pd.read_csv(INTERIM / "team_games.csv").rename(columns={"games": "d1_games", "wins": "d1_wins", "losses": "d1_losses"})
     roster = pd.read_csv(INTERIM / "roster.csv")
+    roster["exp_censored"] = _bool(roster["exp_censored"]).astype(bool)
+    roster["roster_lookback_censored"] = pd.array(_bool(roster["roster_lookback_censored"]), dtype="boolean")
     tg_rows = pd.read_csv(TG_ROWS, usecols=["season", "team_id", "periods"], dtype={"periods": "Int64"})
     return base, outcome, tg, roster, tg_rows
 
@@ -101,8 +104,6 @@ def build():
     # Derived columns
     g = d.groupby("season")["wab"]
     d["wab_z"] = (d["wab"] - g.transform("mean")) / g.transform(lambda s: s.std(ddof=0))
-    has_cont = d["ret_same_min_pct"].notna()
-    d["roster_lookback_censored"] = pd.array(np.where(has_cont, d["season"] == 2016, None), dtype="boolean")
 
     issues = {}
     for season, team, issue in KNOWN_ISSUES:
@@ -122,7 +123,7 @@ def build():
     d = d.drop(columns=["_in_outcome", "_in_tg", "_in_roster"])
     out_cols = [c for c in base.columns if c != "champion" and c not in NOT_OUTPUT] + ["wab_z"] + \
                [c for c in outcome.columns if c not in KEY] + [c for c in tg.columns if c not in KEY] + \
-               [c for c in roster.columns if c not in KEY] + ["roster_lookback_censored", "data_issue"]
+               [c for c in roster.columns if c not in KEY] + ["data_issue"]
     d = d[out_cols].sort_values(KEY).reset_index(drop=True)
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     d.to_csv(OUT_PATH, index=False, float_format="%.6f")
@@ -133,13 +134,14 @@ def build():
 def write_coverage(d: pd.DataFrame):
     seasons = sorted(d["season"].unique())
     seeded = d[d["tournament_seed"].notna()]
-    lines = ["# Coverage: champion_checklist_v2.csv", "",
+    lines = ["# Coverage: champion_checklist_v3.csv", "",
              f"Generated by `scripts/build_dataset.py`. {len(d)} rows, {d.shape[1]} columns, seasons "
              f"{seasons[0]}-{seasons[-1]} except 2020.", "",
              "## Non-null % per column, seeded teams only", "",
              "Columns 100% non-null for seeded teams in every season are listed once, not tabled. NULL is expected in",
-             "some columns: `ap_poll_week6` (unranked), roster columns before 2015/2016, location and Q1 columns",
-             "2005-2007, `data_issue` (empty = no known issue).", ""]
+             "some columns: `ap_poll_week6` (unranked), roster continuity columns and `roster_lookback_censored` in",
+             "2005, `ncaa_filled_min_pct` outside 2023-2024, location and Q1 columns 2005-2007, `data_issue`",
+             "(empty = no known issue).", ""]
     pct = seeded.groupby("season").agg(lambda s: s.notna().mean() * 100).T
     full = [c for c in pct.index if (pct.loc[c] == 100).all()]
     lines += ["100% in every season: " + ", ".join(f"`{c}`" for c in full), ""]
@@ -209,13 +211,21 @@ def check(d: pd.DataFrame):
 
     # No feature is 0 where its source is missing.
     src_cols = {"_in_outcome": ["first_four", "rounds_won", "made_r32", "made_s16", "made_e8", "made_f4", "champion"],
-                "_in_roster": ["team_min_obs", "min_closure_pct", "roster_quality"] + ROSTER_CONTINUITY + ["exp_censored"]}
+                "_in_roster": ["team_min_obs", "min_closure_pct", "roster_quality"] + ROSTER_CONTINUITY +
+                              ["exp_censored", "roster_lookback_censored", "ncaa_filled_min_pct", "player_data_games_pct"]}
     for flag, cols in src_cols.items():
         bad = d.loc[~d[flag], cols].notna().sum()
         if bad.any():
             fail(f"columns filled without their source ({flag}): {bad[bad > 0].to_dict()}")
-    if d.loc[d["season"] <= 2015, ROSTER_CONTINUITY].notna().any().any():
+    if d.loc[d["season"] < FIRST_CONTINUITY_SEASON, ROSTER_CONTINUITY + ["roster_lookback_censored"]].notna().any().any():
         fail("roster continuity filled where no prior player season exists")
+    # roster_lookback_censored is set exactly where continuity is.
+    if (d["roster_lookback_censored"].notna() != d["ret_same_min_pct"].notna()).any():
+        fail("roster_lookback_censored NULL-ness differs from the continuity columns")
+    for col in ("ncaa_filled_min_pct", "player_data_games_pct"):
+        x = d[col].dropna()
+        if ((x < 0) | (x > 1)).any():
+            fail(f"{col} outside [0, 1]")
     if (d.loc[d["_in_roster"], "team_min_obs"] == 0).any():
         fail("team_min_obs is 0 (no player rows) instead of NULL")
     loc_cols = ["road_games", "road_wins", "road_win_pct", "neutral_games", "neutral_wins", "q1_games", "q1_wins"]
